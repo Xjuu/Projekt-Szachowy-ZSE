@@ -1,0 +1,53 @@
+{
+  "id": 3,
+  "white_player": "Klon",
+  "black_player": "Pedal",
+  "status": "checkmate",
+  "winner": "White",
+  "result": "1-0",
+  "created_at": "2026-03-17 20:09:26",
+  "moves": [
+    {
+      "move": "e2e4",
+      "player": "White",
+      "timestamp": "20:10:08",
+      "move_number": 1
+    },
+    {
+      "move": "a7a6",
+      "player": "Black",
+      "timestamp": "20:10:09",
+      "move_number": 2
+    },
+    {
+      "move": "d1h5",
+      "player": "White",
+      "timestamp": "20:10:12",
+      "move_number": 3
+    },
+    {
+      "move": "a6a5",
+      "player": "Black",
+      "timestamp": "20:10:15",
+      "move_number": 4
+    },
+    {
+      "move": "f1c4",
+      "player": "White",
+      "timestamp": "20:10:16",
+      "move_number": 5
+    },
+    {
+      "move": "a5a4",
+      "player": "Black",
+      "timestamp": "20:10:18",
+      "move_number": 6
+    },
+    {
+      "move": "h5f7",
+      "player": "White",
+      "timestamp": "20:10:22",
+      "move_number": 7
+    }
+  ]
+}

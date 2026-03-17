@@ -1,0 +1,65 @@
+{
+  "id": 8,
+  "white_player": "222",
+  "black_player": "Jeden",
+  "status": "checkmate",
+  "winner": "White",
+  "result": "1-0",
+  "created_at": "2026-03-17 20:38:23",
+  "moves": [
+    {
+      "move": "e2e4",
+      "player": "White",
+      "timestamp": "20:38:34",
+      "move_number": 1
+    },
+    {
+      "move": "e7e5",
+      "player": "Black",
+      "timestamp": "20:38:37",
+      "move_number": 2
+    },
+    {
+      "move": "b1c3",
+      "player": "White",
+      "timestamp": "20:38:49",
+      "move_number": 3
+    },
+    {
+      "move": "b8c6",
+      "player": "Black",
+      "timestamp": "20:38:54",
+      "move_number": 4
+    },
+    {
+      "move": "f1c4",
+      "player": "White",
+      "timestamp": "20:38:57",
+      "move_number": 5
+    },
+    {
+      "move": "a7a6",
+      "player": "Black",
+      "timestamp": "20:39:00",
+      "move_number": 6
+    },
+    {
+      "move": "d1h5",
+      "player": "White",
+      "timestamp": "20:39:05",
+      "move_number": 7
+    },
+    {
+      "move": "g8f6",
+      "player": "Black",
+      "timestamp": "20:39:11",
+      "move_number": 8
+    },
+    {
+      "move": "h5f7",
+      "player": "White",
+      "timestamp": "20:39:16",
+      "move_number": 9
+    }
+  ]
+}

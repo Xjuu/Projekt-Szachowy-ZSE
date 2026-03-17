@@ -1,0 +1,53 @@
+{
+  "id": 9,
+  "white_player": "Pedalski",
+  "black_player": "Cwel",
+  "status": "checkmate",
+  "winner": "White",
+  "result": "1-0",
+  "created_at": "2026-03-17 23:08:11",
+  "moves": [
+    {
+      "move": "e2e4",
+      "player": "White",
+      "timestamp": "23:08:14",
+      "move_number": 1
+    },
+    {
+      "move": "b7b6",
+      "player": "Black",
+      "timestamp": "23:08:24",
+      "move_number": 2
+    },
+    {
+      "move": "d1h5",
+      "player": "White",
+      "timestamp": "23:08:31",
+      "move_number": 3
+    },
+    {
+      "move": "b6b5",
+      "player": "Black",
+      "timestamp": "23:08:33",
+      "move_number": 4
+    },
+    {
+      "move": "f1c4",
+      "player": "White",
+      "timestamp": "23:08:35",
+      "move_number": 5
+    },
+    {
+      "move": "a7a6",
+      "player": "Black",
+      "timestamp": "23:08:37",
+      "move_number": 6
+    },
+    {
+      "move": "h5f7",
+      "player": "White",
+      "timestamp": "23:08:40",
+      "move_number": 7
+    }
+  ]
+}

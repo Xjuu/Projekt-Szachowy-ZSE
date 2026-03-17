@@ -1,0 +1,3 @@
+Server.go - Server, pokazuje gry na planszy, hostuje strony i wysyla dane do chess.db (SQLite)
+main.cpp - Sprawdza legalność ruchów i je wysyla
+chess-library - paczka z skryptami do szachów
