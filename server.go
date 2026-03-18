@@ -1,3 +1,22 @@
+// Chess Relay Server
+// ===================
+// Serwer HTTP do obsługi gier szachowych:
+// - tworzenie nowych gier
+// - zapisywanie ruchów
+// - aktualizacja statusu (checkmate/stalemate)
+// - udostępnianie API (/state)
+// - viewer webowy (frontend wbudowany)
+//
+// Dane przechowywane w SQLite (WAL mode)
+// Dodatkowo zapis partii do plików:
+// - PGN (do analizy szachowej)
+// - JSON (backup / integracje)
+//
+// UWAGA:
+// - brak autoryzacji (każdy może wysyłać ruchy)
+// - brak walidacji ruchów (serwer ufa klientowi)
+// - brak transakcji (możliwe race condition przy wielu klientach)
+
 package main
 
 import (
@@ -14,18 +33,22 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Globalna baza danych + mutex
+// Mutex blokuje dostęp przy zapisie (proste, ale mało skalowalne)
 var (
 	db *sql.DB
 	mu sync.Mutex
 )
 
+// Reprezentuje pojedynczy ruch w grze
 type MoveRecord struct {
-	Move      string `json:"move"`
+	Move      string `json:"move"` // ruch w formacie UCI (np. e2e4)
 	Player    string `json:"player"`
-	Timestamp string `json:"timestamp"`
-	MoveNum   int    `json:"move_number"`
+	Timestamp string `json:"timestamp"` // czas ruchu
+	MoveNum   int    `json:"move_number"` // numer ruchu
 }
 
+// Pełny stan gry
 type GameState struct {
 	ID          int64        `json:"id"`
 	WhitePlayer string       `json:"white_player"`
@@ -36,6 +59,7 @@ type GameState struct {
 	CreatedAt   string       `json:"created_at"`
 }
 
+// Inicjalizuje bazę danych i tworzy tabele jeśli nie istnieją
 func initDB() error {
 	var err error
 	db, err = sql.Open("sqlite", "./chess.db")
@@ -66,6 +90,7 @@ func initDB() error {
 	return err
 }
 
+// Pobiera pełny stan gry + wszystkie ruchy
 func getGame(id int64) (*GameState, error) {
 	row := db.QueryRow(
 		"SELECT id, white_player, black_player, status, winner, created_at FROM games WHERE id = ?", id)
@@ -90,6 +115,7 @@ func getGame(id int64) (*GameState, error) {
 	return g, nil
 }
 
+// Pobiera listę wszystkich gier (bez ruchów - szybkie)
 func getAllGames() ([]*GameState, error) {
 	rows, err := db.Query(
 		"SELECT id, white_player, black_player, status, winner, created_at FROM games ORDER BY id")
@@ -106,6 +132,7 @@ func getAllGames() ([]*GameState, error) {
 	return games, nil
 }
 
+// Zapisuje Gre w formatach: Json + PGN
 func saveGameFiles(game *GameState) {
 	os.MkdirAll("gry", 0755)
 
@@ -156,6 +183,7 @@ func saveGameFiles(game *GameState) {
 	fmt.Printf("[FILES] Saved gry/%d.pgn and gry/%d.json\n", game.ID, game.ID)
 }
 
+// Wyświetla gry w konsoli (debug / monitoring)
 func printGamesTable() {
 	rows, err := db.Query(
 		"SELECT id, white_player, black_player, status, winner, created_at FROM games ORDER BY id")
@@ -186,6 +214,8 @@ func printGamesTable() {
 	fmt.Println()
 }
 
+// Tworzy nową grę
+// POST /newgame
 func handleNewGame(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -255,6 +285,7 @@ func handleMove(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"ok":true,"move_number":%d}`, moveNum)
 }
 
+
 func handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -315,6 +346,7 @@ func handleViewer(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, viewerHTML)
 }
 
+// Pobiera lokalny adres IP (hack przez UDP do 8.8.8.8)
 func getLocalIP() string {
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {
@@ -324,6 +356,7 @@ func getLocalIP() string {
 	return conn.LocalAddr().(*net.UDPAddr).IP.String()
 }
 
+// Start serwera HTTP
 func main() {
 	if err := initDB(); err != nil {
 		fmt.Println("DB init error:", err)
@@ -359,7 +392,7 @@ func main() {
 	}
 }
 
-const viewerHTML = `<!DOCTYPE html>
+const viewerHTML = `<!DOCTYPE html>Refactor main.cpp for improved readability and structure
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -714,3 +747,6 @@ setInterval(refresh, 1500);
 </script>
 </body>
 </html>`
+
+// Serwer działa na porcie 8080
+// Brak TLS (HTTP only)
