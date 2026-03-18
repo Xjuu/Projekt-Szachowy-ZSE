@@ -10,6 +10,7 @@
 
 using namespace chess;
 
+// Usuwa port z adresu IP (np. "127.0.0.1:8080" -> "127.0.0.1")
 std::string stripPort(const std::string& ip) {
     auto pos = ip.find(':');
     if (pos != std::string::npos)
@@ -17,6 +18,12 @@ std::string stripPort(const std::string& ip) {
     return ip;
 }
 
+// Wysyła prosty request HTTP POST przez sockety
+// ip      - adres serwera
+// port    - port (np. 8080)
+// path    - endpoint (np. "/move")
+// body    - dane JSON
+// Zwraca cały response jako string
 std::string httpPost(const std::string& ip, int port, const std::string& path, const std::string& body) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return "";
@@ -60,6 +67,7 @@ std::string httpPost(const std::string& ip, int port, const std::string& path, c
     return response;
 }
 
+// Parsuje game_id z odpowiedzi JSON (bardzo "na surowo")
 std::string parseGameId(const std::string& response) {
     auto pos = response.find("\"game_id\"");
     if (pos == std::string::npos) return "";
@@ -80,6 +88,7 @@ std::string parseGameId(const std::string& response) {
     }
 }
 
+// Tworzy nową grę na serwerze
 std::string requestNewGame(const std::string& ip,
                            const std::string& whiteName,
                            const std::string& blackName) {
@@ -93,6 +102,7 @@ std::string requestNewGame(const std::string& ip,
     return id;
 }
 
+// Wysyła ruch do serwera
 void sendMove(const std::string& ip, const std::string& gameId,
               const std::string& move, const std::string& color) {
     std::string body = "{\"game_id\":" + gameId + ","
@@ -105,6 +115,7 @@ void sendMove(const std::string& ip, const std::string& gameId,
         std::cerr << "[network] Server error: " << resp.substr(0, 120) << "\n";
 }
 
+// Wysyła status gry (checkmate/stalemate)
 void sendStatus(const std::string& ip, const std::string& gameId,
                 const std::string& status, const std::string& winner) {
     std::string body = "{\"game_id\":" + gameId + ","
@@ -115,6 +126,7 @@ void sendStatus(const std::string& ip, const std::string& gameId,
         std::cerr << "[network] Status not sent.\n";
 }
 
+// Obsługa ruchu Gracza
 bool handleTurn(Board& board, const Movelist& moves,
                 const std::string& playerName,
                 const std::string& playerColor,
