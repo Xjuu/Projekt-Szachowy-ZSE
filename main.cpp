@@ -7,24 +7,48 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <chrono>
+#include <cstdio>
 
 using namespace chess;
+using Clock = std::chrono::steady_clock;
+using Ms    = std::chrono::milliseconds;
 
-// Usuwa port z adresu IP (np. "127.0.0.1:8080" -> "127.0.0.1")
+// ─── Kontrola czasu ───────────────────────────────────────────────────────────
+
+struct TimeControl {
+    long long whiteMs = 0;
+    long long blackMs = 0;
+    bool      enabled = false;
+};
+
+std::string formatTime(long long ms) {
+    if (ms < 0) ms = 0;
+    long long secs = ms / 1000;
+    long long mins = secs / 60;
+    secs %= 60;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%02lld:%02lld", mins, secs);
+    return std::string(buf);
+}
+
+void printClocks(const TimeControl& tc) {
+    std::cout << "  +----------------------------+\n";
+    std::cout << "  | Biali: " << formatTime(tc.whiteMs)
+              << "   Czarni: " << formatTime(tc.blackMs) << " |\n";
+    std::cout << "  +----------------------------+\n";
+}
+
+// ─── Siec ─────────────────────────────────────────────────────────────────────
+
 std::string stripPort(const std::string& ip) {
     auto pos = ip.find(':');
-    if (pos != std::string::npos)
-        return ip.substr(0, pos);
+    if (pos != std::string::npos) return ip.substr(0, pos);
     return ip;
 }
 
-// Wysyła prosty request HTTP POST przez sockety
-// ip      - adres serwera
-// port    - port (np. 8080)
-// path    - endpoint (np. "/move")
-// body    - dane JSON
-// Zwraca cały response jako string
-std::string httpPost(const std::string& ip, int port, const std::string& path, const std::string& body) {
+std::string httpPost(const std::string& ip, int port,
+                     const std::string& path, const std::string& body) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return "";
 
@@ -34,7 +58,7 @@ std::string httpPost(const std::string& ip, int port, const std::string& path, c
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
+    addr.sin_port   = htons(port);
     inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
 
     if (connect(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
@@ -48,103 +72,136 @@ std::string httpPost(const std::string& ip, int port, const std::string& path, c
         << "Host: " << ip << ":" << port << "\r\n"
         << "Content-Type: application/json\r\n"
         << "Content-Length: " << body.size() << "\r\n"
-        << "Connection: close\r\n"
-        << "\r\n"
+        << "Connection: close\r\n\r\n"
         << body;
-
     std::string reqStr = req.str();
     send(sock, reqStr.c_str(), reqStr.size(), 0);
 
     std::string response;
     char buf[4096];
     int n;
-    while ((n = recv(sock, buf, sizeof(buf)-1, 0)) > 0) {
+    while ((n = recv(sock, buf, sizeof(buf) - 1, 0)) > 0) {
         buf[n] = '\0';
         response += buf;
     }
-
     close(sock);
     return response;
 }
 
-// Parsuje game_id z odpowiedzi JSON (bardzo "na surowo")
 std::string parseGameId(const std::string& response) {
     auto pos = response.find("\"game_id\"");
     if (pos == std::string::npos) return "";
     auto colon = response.find(':', pos);
     if (colon == std::string::npos) return "";
     size_t start = colon + 1;
-    while (start < response.size() && (response[start] == ' ' || response[start] == '\n' || response[start] == '\r'))
+    while (start < response.size() &&
+           (response[start] == ' ' || response[start] == '\n' || response[start] == '\r'))
         start++;
     if (start >= response.size()) return "";
     if (response[start] == '"') {
         auto q2 = response.find('"', start + 1);
         if (q2 == std::string::npos) return "";
         return response.substr(start + 1, q2 - start - 1);
-    } else {
-        size_t end = start;
-        while (end < response.size() && isdigit(response[end])) end++;
-        return response.substr(start, end - start);
     }
+    size_t end = start;
+    while (end < response.size() && isdigit(response[end])) end++;
+    return response.substr(start, end - start);
 }
 
-// Tworzy nową grę na serwerze
+// Tworzy nowa gre na serwerze (z opcjonalna kontrola czasu)
 std::string requestNewGame(const std::string& ip,
                            const std::string& whiteName,
-                           const std::string& blackName) {
-    std::string body = "{\"white_player\":\"" + whiteName + "\","
-                        "\"black_player\":\"" + blackName + "\"}";
-    std::cerr << "[debug] POST /newgame to " << ip << ":8080\n";
-    std::string resp = httpPost(ip, 8080, "/newgame", body);
-    std::cerr << "[debug] raw response: [" << resp << "]\n";
+                           const std::string& blackName,
+                           long long timeControlMs) {
+    std::ostringstream body;
+    body << "{\"white_player\":\"" << whiteName << "\","
+         << "\"black_player\":\"" << blackName << "\","
+         << "\"time_control_ms\":" << timeControlMs << "}";
+    std::cerr << "[debug] POST /newgame\n";
+    std::string resp = httpPost(ip, 8080, "/newgame", body.str());
+    std::cerr << "[debug] response: [" << resp << "]\n";
     std::string id = parseGameId(resp);
-    std::cerr << "[debug] parsed game_id: [" << id << "]\n";
+    std::cerr << "[debug] game_id: [" << id << "]\n";
     return id;
 }
 
-// Wysyła ruch do serwera
+// Wysyla ruch z pozostalym czasem gracza po ruchu
 void sendMove(const std::string& ip, const std::string& gameId,
-              const std::string& move, const std::string& color) {
-    std::string body = "{\"game_id\":" + gameId + ","
-                       "\"move\":\"" + move + "\","
-                       "\"player\":\"" + color + "\"}";
-    std::string resp = httpPost(ip, 8080, "/move", body);
+              const std::string& move, const std::string& color,
+              long long timeLeftMs) {
+    std::ostringstream body;
+    body << "{\"game_id\":" << gameId << ","
+         << "\"move\":\"" << move << "\","
+         << "\"player\":\"" << color << "\","
+         << "\"time_left_ms\":" << timeLeftMs << "}";
+    std::string resp = httpPost(ip, 8080, "/move", body.str());
     if (resp.empty())
-        std::cerr << "[network] Move not sent.\n";
+        std::cerr << "[network] Ruch nie wyslany.\n";
     else if (resp.find("\"ok\":true") == std::string::npos)
-        std::cerr << "[network] Server error: " << resp.substr(0, 120) << "\n";
+        std::cerr << "[network] Blad serwera: " << resp.substr(0, 120) << "\n";
 }
 
-// Wysyła status gry (checkmate/stalemate)
+// Wysyla status koncowy gry
 void sendStatus(const std::string& ip, const std::string& gameId,
                 const std::string& status, const std::string& winner) {
-    std::string body = "{\"game_id\":" + gameId + ","
-                       "\"status\":\"" + status + "\","
-                       "\"winner\":\"" + winner + "\"}";
-    std::string resp = httpPost(ip, 8080, "/status", body);
+    std::ostringstream body;
+    body << "{\"game_id\":" << gameId << ","
+         << "\"status\":\"" << status << "\","
+         << "\"winner\":\"" << winner << "\"}";
+    std::string resp = httpPost(ip, 8080, "/status", body.str());
     if (resp.empty())
-        std::cerr << "[network] Status not sent.\n";
+        std::cerr << "[network] Status nie wyslany.\n";
 }
 
-// Obsługa ruchu Gracza
-bool handleTurn(Board& board, const Movelist& moves,
-                const std::string& playerName,
-                const std::string& playerColor,
-                const std::string& serverIp, const std::string& gameId,
-                bool networked, std::list<std::string>& moveHistory)
-{
-    std::cout << "[" << playerColor << "] " << playerName << " to move\n";
-    std::cout << "Enter move in UCI format (e.g. e2e4): ";
+// ─── Obsluga tury ─────────────────────────────────────────────────────────────
+//
+// Zwraca:
+//   1  – poprawny ruch wykonany
+//   0  – nieprawidlowy/nielegalny input, ponow probe
+//  -1  – skonczyl sie czas (przegrana na czas)
 
+int handleTurn(Board& board, const Movelist& moves,
+               const std::string& playerName,
+               const std::string& playerColor,
+               const std::string& serverIp, const std::string& gameId,
+               bool networked, std::list<std::string>& moveHistory,
+               TimeControl& tc)
+{
+    long long& myTime = (playerColor == "White") ? tc.whiteMs : tc.blackMs;
+
+    if (tc.enabled) {
+        std::cout << "\n";
+        printClocks(tc);
+        if (myTime <= 0) {
+            std::cout << "[" << playerColor << "] Czas minul!\n";
+            return -1;
+        }
+    }
+
+    std::cout << "[" << playerColor << "] " << playerName << " gra (UCI): ";
+    std::cout.flush();
+
+    // Mierzenie czasu ruchu
+    auto t0 = Clock::now();
     std::string input;
     std::cin >> input;
+    long long elapsed = std::chrono::duration_cast<Ms>(Clock::now() - t0).count();
+
+    if (tc.enabled) {
+        myTime -= elapsed;
+        if (myTime <= 0) {
+            myTime = 0;
+            std::cout << "[" << playerColor << "] Skonczyl sie czas!\n";
+            return -1;
+        }
+    }
 
     Move move;
     try {
         move = uci::uciToMove(board, input);
     } catch (...) {
-        std::cout << "Invalid format. Try again.\n";
-        return false;
+        std::cout << "Nieprawidlowy format. Sprobuj ponownie.\n";
+        return 0;
     }
 
     bool legal = false;
@@ -152,100 +209,143 @@ bool handleTurn(Board& board, const Movelist& moves,
         if (uci::moveToUci(m) == input) { legal = true; break; }
 
     if (!legal) {
-        std::cout << "Illegal move. Try again.\n";
-        return false;
+        std::cout << "Nielegalny ruch. Sprobuj ponownie.\n";
+        return 0;
     }
 
     board.makeMove(move);
-    if (networked) sendMove(serverIp, gameId, input, playerColor);
+    long long sendTime = tc.enabled ? myTime : 0;
+    if (networked) sendMove(serverIp, gameId, input, playerColor, sendTime);
     moveHistory.push_back(input);
-    return true;
+    return 1;
 }
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
 int main() {
     std::string serverIp;
-    std::cout << "Enter relay server IP (or press Enter to skip networking): ";
+    std::cout << "Adres IP serwera (Enter = tryb lokalny): ";
     std::getline(std::cin, serverIp);
     serverIp = stripPort(serverIp);
-
     bool networked = !serverIp.empty();
-    std::string gameId;
+
     std::string whiteName = "White";
     std::string blackName = "Black";
-
-    std::cout << "White player name: ";
+    std::cout << "Nazwa gracza Bialego: ";
     std::getline(std::cin, whiteName);
     if (whiteName.empty()) whiteName = "White";
-
-    std::cout << "Black player name: ";
+    std::cout << "Nazwa gracza Czarnego: ";
     std::getline(std::cin, blackName);
     if (blackName.empty()) blackName = "Black";
 
+    // Konfiguracja kontroli czasu
+    TimeControl tc;
+    std::string tcChoice;
+    std::cout << "Uzyc kontroli czasu? (t/n) [n]: ";
+    std::getline(std::cin, tcChoice);
+    if (!tcChoice.empty() && (tcChoice[0] == 't' || tcChoice[0] == 'T' ||
+                               tcChoice[0] == 'y' || tcChoice[0] == 'Y')) {
+        tc.enabled = true;
+        std::cout << "Minuty na gracza [10]: ";
+        std::string mStr;
+        std::getline(std::cin, mStr);
+        int minutes = mStr.empty() ? 10 : std::stoi(mStr);
+        if (minutes < 1) minutes = 1;
+        tc.whiteMs = tc.blackMs = (long long)minutes * 60 * 1000;
+        std::cout << "Kontrola czasu: " << minutes << " min na gracza\n\n";
+    }
+
+    // Rejestracja gry na serwerze
+    std::string gameId;
     if (networked) {
-        gameId = requestNewGame(serverIp, whiteName, blackName);
+        long long tcMs = tc.enabled ? tc.whiteMs : 0;
+        gameId = requestNewGame(serverIp, whiteName, blackName, tcMs);
         if (gameId.empty()) {
-            std::cout << "Could not reach server - running in local-only mode.\n\n";
+            std::cout << "Brak polaczenia z serwerem - tryb lokalny.\n\n";
             networked = false;
         } else {
-            std::cout << "\n";
-            std::cout << "╔══════════════════════════════════════╗\n";
-            std::cout << "║           GAME STARTED               ║\n";
-            std::cout << "╠══════════════════════════════════════╣\n";
-            std::cout << "║  Game ID : #" << gameId << "                    ║\n";
-            std::cout << "║  White   : " << whiteName << "\n";
-            std::cout << "║  Black   : " << blackName << "\n";
-            std::cout << "║  Watch   : http://" << serverIp << ":8080  ║\n";
-            std::cout << "╚══════════════════════════════════════╝\n\n";
+            std::cout << "\n"
+                      << "+=========================================+\n"
+                      << "|             GRA ROZPOCZETA             |\n"
+                      << "+=========================================+\n"
+                      << "|  Numer gry : #" << gameId << "\n"
+                      << "|  Biali     : " << whiteName << "\n"
+                      << "|  Czarni    : " << blackName << "\n";
+            if (tc.enabled)
+                std::cout << "|  Czas      : " << formatTime(tc.whiteMs) << " na gracza\n";
+            std::cout << "|  Widok     : http://" << serverIp << ":8080\n"
+                      << "+=========================================+\n\n";
         }
     } else {
-        std::cout << "Running in local-only mode.\n\n";
+        std::cout << "Tryb lokalny (bez serwera).\n\n";
     }
 
     std::list<std::string> moveHistory;
     Board board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
     std::string winner;
 
+    // Glowna petla gry
     while (true) {
         Movelist moves;
         movegen::legalmoves(moves, board);
 
-        bool isWhite          = (board.sideToMove() == Color::WHITE);
-        std::string playerName    = isWhite ? whiteName    : blackName;
-        std::string playerColor   = isWhite ? "White"      : "Black";
-        std::string opponentColor = isWhite ? "Black"      : "White";
+        bool        isWhite       = (board.sideToMove() == Color::WHITE);
+        std::string playerName    = isWhite ? whiteName  : blackName;
+        std::string playerColor   = isWhite ? "White"    : "Black";
+        std::string opponentColor = isWhite ? "Black"    : "White";
 
+        // Koniec gry (mat / pat)
         if (moves.size() == 0) {
             std::string status;
             if (board.inCheck()) {
                 status = "checkmate";
                 winner = opponentColor;
-                std::cout << "\n*** Checkmate! "
+                std::cout << "\n*** Mat! "
                           << (isWhite ? blackName : whiteName)
-                          << " (" << opponentColor << ") wins! ***\n";
+                          << " (" << opponentColor << ") wygrywa! ***\n";
             } else {
                 status = "stalemate";
                 winner = "Draw";
-                std::cout << "\n*** Stalemate! It's a draw. ***\n";
+                std::cout << "\n*** Pat! Remis. ***\n";
             }
             if (networked) sendStatus(serverIp, gameId, status, opponentColor);
             break;
         }
 
-        while (!handleTurn(board, moves, playerName, playerColor,
-                           serverIp, gameId, networked, moveHistory))
-            ;
+        // Tura gracza
+        int result = handleTurn(board, moves, playerName, playerColor,
+                                serverIp, gameId, networked, moveHistory, tc);
+
+        if (result == -1) {
+            // Przegrana na czas
+            winner = opponentColor;
+            std::cout << "\n*** " << playerName << " (" << playerColor
+                      << ") przegral na czas!  "
+                      << (isWhite ? blackName : whiteName)
+                      << " (" << opponentColor << ") wygrywa! ***\n";
+            if (tc.enabled) printClocks(tc);
+            if (networked) sendStatus(serverIp, gameId, "timeout", opponentColor);
+            break;
+        }
+        // result == 0 → petla ponowi probe automatycznie
     }
 
-    std::cout << "\n--- Game history ---\n";
-    std::cout << "Game ID : " << (gameId.empty() ? "local" : "#" + gameId) << "\n";
-    std::cout << "White   : " << whiteName << "\n";
-    std::cout << "Black   : " << blackName << "\n";
-    std::cout << "Result  : " << winner << "\n\n";
+    // Podsumowanie partii
+    std::cout << "\n--- Historia partii ---\n"
+              << "Gra      : " << (gameId.empty() ? "lokalna" : "#" + gameId) << "\n"
+              << "Biali    : " << whiteName << "\n"
+              << "Czarni   : " << blackName << "\n"
+              << "Wynik    : " << winner << "\n";
+    if (tc.enabled) {
+        std::cout << "Czas Biali  : " << formatTime(tc.whiteMs) << "\n"
+                  << "Czas Czarni : " << formatTime(tc.blackMs) << "\n";
+    }
+    std::cout << "\n";
     int i = 1;
     for (const auto& m : moveHistory)
         std::cout << i++ << ". " << m << "\n";
 
-    std::cout << "\nPress Enter to exit...";
+    std::cout << "\nNacisnij Enter aby wyjsc...";
     std::cin.ignore();
     std::cin.get();
     return 0;
