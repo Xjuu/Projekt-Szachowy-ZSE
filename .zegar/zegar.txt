@@ -1,0 +1,138 @@
+Artykuł 6: Zegar szachowy
+6.1 „Zegar szachowy” oznacza zegar z dwoma wyświetlaczami czasu, połączonymi ze sobą w
+taki sposób, że tylko jeden z nich może działać na raz. „Zegar” w Przepisach Szachowych oznacza
+jeden z dwóch wyświetlaczy czasu. Każdy wyświetlacz ma „flagę”.
+„Opadnięcie flagi” oznacza upłynięcie przydzielonego zawodnikowi/zawodniczce czasu.
+6.2 Obsługa zegara szachowego:
+6.2.1 Podczas partii każdy zawodnik/zawodniczka, po wykonaniu swojego posunięcia na
+szachownicy, zatrzymuje swój zegar i uruchamia zegar przeciwnika/przeciwniczki (to znaczy
+naciska swój zegar). To „kończy” posunięcie. Posunięcie uznaje się również za zakończone, jeśli:
+6.2.1.1 posunięcie kończy grę (patrz art. 5.1.1, 5.2.1, 5.2.2, 9.2.1, 9.6.1 i 9.6.2), lub
+6.2.1.2 zawodnik/zawodniczka wykonał/a kolejny ruch, gdy jego/jej poprzedni ruch nie został
+zakończony.
+6.2.2 Zawodnik/zawodniczka musi mieć możliwość przełączenia zegara po wykonaniu
+posunięcia, nawet po wykonaniu następnego posunięcia przez przeciwnika/przeciwniczkę. Czas
+między wykonaniem posunięcia na szachownicy a naciśnięciem zegara jest traktowany jako część
+czasu przydzielonego zawodnikowi/zawodniczce.
+6.2.3 Zawodnik/zawodniczka musi przełączyć swój zegar tą samą ręką, którą wykonał/a swoje
+posunięcie. Zabrania się zawodnikowi/zawodniczce trzymania palca/dłoni na zegarze co może
+uniemożliwiać przełączenie zegara przeciwnikowi/przeciwniczce.
+6.2.4 Zawodnicy muszą w prawidłowy sposób obsługiwać zegar szachowy. Zabrania się siłowego
+naciskania, podnoszenia lub
+przewracania/przesuwania zegara jak również przełączania zegara przed wykonaniem posunięcia.
+Niewłaściwa obsługa zegara będzie karana zgodnie z Artykułem 12.9.
+6.2.5 Tylko zawodnik/zawodniczka, którego/której zegar jest uruchomiony, może poprawiać
+bierki.
+6.2.6 Jeśli zawodnik/zawodniczka nie jest w stanie samodzielnie korzystać z
+zegara, asystent, który musi być zaakceptowany przez arbitra, może zostać upoważniony do
+przełączania zegara za niego/nią. Jego/jej zegar zostanie skorygowany przez arbitra według jego/jej
+najlepszego rozeznania. Ta korekta zegara szachowego nie dotyczy zawodnika/zawodniczki z
+niepełnosprawnością.
+6.3 Przydzielony czas:
+6.3.1 Grając partię z zegarem szachowym, każdy z zawodników jest zobowiązany do zakończenia
+określonej liczby posunięć lub wszystkich posunięć w regulaminowym czasie, z ewentualnym
+uwzględnieniem dodatkowego czasu przyznanego na każde posunięcie. Tempo gry musi być
+sprecyzowane przed rozpoczęciem zawodów.
+6.3.2 Czas do namysłu, zaoszczędzony przez zawodnika/zawodniczkę w
+jednym etapie gry, jest dodawany do jego/jej czasu w następnym etapie tam, gdzie ma to
+zastosowanie. W „opóźnionej kontroli czasu“ obaj zawodnicy otrzymują tzw. „podstawowy czas do
+namysłu“. Każdy zawodnik/zawodniczka otrzymuje również „ściśle określony dodatkowy czas“ na
+każde posunięcie. Odliczanie podstawowego czasu do namysłu następuje z chwilą wyczerpania
+czasu dodatkowego. Jeżeli zawodnik/zawodniczka przełącza zegar przed upływem czasu
+dodatkowego, to jego podstawowy czas do namysłu nie ulega zmianie, niezależnie od tego, jaką
+część dodatkowego czasu wykorzystał na posunięcie.
+6.4 Natychmiast po opadnięciu chorągiewki, należy sprawdzić czy zostały spełnione wymagania
+art 6.3.1.
+6.5 Przed rozpoczęciem partii arbiter ustala miejsce ustawienia zegara na stole do gry.
+6.6 O ustalonej godzinie rozpoczęcia partii uruchamia się zegar zawodnika/zawodniczki
+mającego/mającej białe bierki.
+6.7 Czas spóźnienia na rundę:
+6.7.1 Regulamin turnieju powinien precyzować godzinę rozpoczęcia rundy i ewentualny
+dopuszczalny określony czas spóźnienia się na rozpoczęcie gry. Jeśli czas spóźnienia nie jest
+określony, to domyślnie wynosi zero. Każdy zawodnik/zawodniczka, który/która przybędzie do
+szachownicy po tym czasie przegrywa partię, chyba, że arbiter podejmie inną decyzję.
+6.7.2 Gdy regulamin turniejowy określa inne warunki spóźnienia się na
+partię, niż zero minut i żaden z zawodników nie jest obecny na rozpoczęciu rundy, to konsekwencje
+opóźnionego stawienia się do gry ponosi zawodnik/zawodniczka mający/mająca białe bierki. Zegar
+białych jest włączony, aż do chwili przybycia tego/tej zawodnika/zawodniczki, chyba że w
+regulaminie turnieju są określone inne wymagania lub sędzia podejmie inną decyzję.
+6.8 Przyjmuje się, że nastąpiło przekroczenie czasu (opadnięcie chorągiewki), gdy sędzia
+stwierdzi ten fakt lub gdy któryś/któraś zawodnik/zawodniczka złoży prawidłową reklamację.
+6.9 Z wyjątkiem sytuacji sprecyzowanych w artykułach: 5.1.1, 5.1.2, 5.2.1, 5.2.2, 5.2.3,
+zawodnik/zawodniczka, który/która nie zakończył/a wykonywania regulaminowej liczby posunięć
+w ustalonym czasie, przegrywa partię. Jednakże partię uznaje się za remisową, jeżeli w końcowej
+pozycji przeciwnik/ przeciwniczka, za pomocą jakiejkolwiek serii prawidłowych posunięć, nie
+może zamatować króla zawodnika, który przekroczył czas.
+6.10 Ustawienie zegara szachowego:
+6.10.1 Każde wskazanie zegara uważa się za miarodajne, jeżeli nie ma widocznych jego
+uszkodzeń. Uszkodzony zegar powinien być wymieniony przez sędziego, który według swego
+najlepszego rozeznania, powinien określić czas zużyty przez obydwoje zawodników i nastawić go
+na nowym/wymienionym zegarze.
+6.10.2 Jeśli podczas gry okaże się, że ustawienie jednego lub obu zegarów jest nieprawidłowe,
+zawodnicy lub arbiter natychmiast powinni zatrzymać zegar szachowy. Arbiter powinien nastawić
+prawidłowy czas, dokonać korekty licznika posunięć i dostosować zużycie czasu do liczby
+wykonanych posunięć. Sędzia powinien określić czas zużyty przez obu zawodników według swego
+najlepszego rozeznania.
+6.11.1 Jeżeli partia wymaga przerwania, sędzia powinien zatrzymać zegar.
+6.11.2 Zawodnik/zawodniczka może zatrzymać zegar tylko w sytuacjach które wymagają asysty
+sędziego, na przykład gdy dokonano promocji, a wymagana figura nie jest dostępna.
+6.11.3 Sędzia podejmuje decyzję o wznowieniu partii.
+6.11.4 W przypadku zatrzymania zegara w celu wezwania arbitra, to do niego/ niej należy ocena
+czy powód przerwania partii był uzasadniony. Jeżeli okaże się, że zawodnik/zawodniczka nie miał/a
+istotnego powodu do zatrzymania zegara, to powinien być ukarany zgodnie z art. 12.9.
+6.12.1 Ekrany, monitory lub szachownice demonstracyjne, pokazujące aktualną pozycję na
+szachownicy, posunięcia i liczbę wykonanych posunięć, jak również zegary pokazujące liczbę
+wykonanych/zakończonych posunięć, są dozwolone na sali gry.
+6.12.2 Jednakże zawodnik/zawodniczka nie ma prawa składania reklamacji, opierając się
+wyłącznie na informacji uzyskanej w ten sposób.
+Artykuł 7: Nieprawidłowości
+7.1 Jeśli wystąpi nieprawidłowość i bierki muszą zostać przywrócone do poprzedniej pozycji,
+arbiter powinien dokonać najlepszego osądu, aby określić czas, który ma być ustawiony na zegarze.
+Jeżeli w czasie partii wystąpiła nieprawidłowość i należy odtworzyć prawidłową pozycję ustawiając
+bierki na właściwych polach, to arbiter powinien określić czas obojga zawodników na zegarze
+według swego najlepszego rozeznania. Obejmuje to prawo do zmiany ustawienia zegara. Jeśli to
+konieczne, to powinien również dokonać korekty licznika posunięć.
+7.2.1 Jeżeli w trakcie partii zostanie stwierdzone, że początkowa (wyjściowa) pozycja bierek była
+niewłaściwa, to partia zostaje unieważniona i należy ją rozegrać od nowa.
+7.2.2 Jeśli podczas gry okaże się, że szachownica została ustawiona niezgodnie z Artykułem 2.1,
+gra będzie kontynuowana, ale osiągnięta pozycja musi zostać przeniesiona na prawidłowo
+ustawioną szachownicę.
+7.3 Jeżeli rozpoczęto partię odmiennymi kolorami, niż należało, i obydwoje zawodników
+wykonało mniej, niż 10 posunięć, to należy partię rozpocząć od nowa z właściwymi kolorami
+bierek. Po wykonaniu 10 lub większej liczby posunięć partię należy kontynuować.
+7.4 Przemieszczone bierki:
+7.4.1 Jeśli zawodnik/zawodniczka przemieści jedną lub więcej bierek, to jest zobowiązany/a do
+przywrócenia właściwej pozycji na szachownicy na własnym czasie.
+7.4.2 Jeśli zachodzi konieczność, to zawodnik/zawodniczka lub jego/jej
+przeciwnik/przeciwniczka powinni zatrzymać zegar i prosić o asystę arbitra.
+7.4.3 Arbiter może ukarać zawodnika/zawodniczkę, który/a przemieścił/a bierki.
+7.5 Nieprawidłowe posunięcia:
+7.5.1 Nieprawidłowe posunięcie uznaje się za zakończone kiedy zawodnik/zawodniczka
+przełączy swój zegar. Jeżeli w trakcie partii stwierdzono, że zostało wykonane i zakończone
+nieprawidłowe posunięcie, to należy niezwłocznie przywrócić pozycję, która była przed
+wystąpieniem nieprawidłowości. Jeżeli nie można odtworzyć właściwej pozycji, powstałej tuż
+przed wystąpieniem nieprawidłowości, to partię należy kontynuować od pozycji, do której nie ma
+wątpliwości, że była prawidłowa. Artykuły 4.3 i 4.7 należy stosować w odniesieniu do posunięcia,
+które zastępuje nieprawidłową kontynuację. Po odtworzeniu prawidłowej pozycji, partia powinna
+być kontynuowana.
+7.5.2 Jeżeli zawodnik/zawodniczka postawił/a piona na polu promocji, przełączył/a zegar, ale nie
+zamienił/a piona na promowaną figurę, to posunięcie jest nieprawidłowe. Piona należy zamienić na
+hetmana tego samego koloru.
+7.5.3 Jeżeli zawodnik/zawodniczka naciśnie zegar bez wykonania posunięcia, to jego
+postępowanie jest karane analogicznie, jakby wykonał nieprawidłowe posunięcie.
+7.5.4 Jeśli zawodnik/zawodniczka użyje obu rąk w celu wykonania jakiegokolwiek posunięcia
+(np. roszady, zbicia bierki lub promocji) i naciśnie zegar, to jego postępowanie jest karane
+analogicznie, jakby wykonał/a nieprawidłowe posunięcie.
+7.5.5 Po działaniach omówionych w artykułach 7.5.1, 7.5.2, 7.5.3 albo 7.5.4, w przypadku
+wykonania i zakończenia pierwszego nieprawidłowego posunięcia przez któregokolwiek z
+zawodników, sędzia powinien przyznać przeciwnikowi/przeciwniczce bonifikatę w postaci dwóch
+minut dodatkowego czasu do namysłu; po wykonaniu i zakończeniu drugiego nieprawidłowego
+posunięcia, przez tego samego zawodnika/ zawodniczkę, sędzia powinien orzec jego/jej porażkę.
+Jednakże partię uznaje się za remisową, jeżeli w końcowej pozycji przeciwnik/przeciwniczka, za
+pomocą jakiejkolwiek serii prawidłowych posunięć, nie może zamatować króla ukaranego
+zawodnika/zawodniczki.
+7.6 Jeśli podczas partii okaże się, że jakakolwiek bierka została przesunięta z właściwego pola, to
+należy przywrócić pozycję bezpośrednio sprzed wystąpienia nieprawidłowości. Jeżeli nie można
+odtworzyć właściwej pozycji, powstałej tuż przed wystąpieniem nieprawidłowości, to partię należy
+kontynuować od pozycji, do której nie ma wątpliwości, że była prawidłowa. Po odtworzeniu
+prawidłowej pozycji, partia powinna być kontynuowana.
