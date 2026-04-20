@@ -5,10 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 cd "$SCRIPT_DIR"
 
-if [[ ! -f "Makefile" || ! -f "src/main.c" || ! -f "src/clock.c" || ! -f "src/ui.c" ]]; then
-	echo "Blad: brakuje plikow projektu w katalogu: $SCRIPT_DIR"
-	echo "Wymagane: Makefile oraz src/main.c, src/clock.c, src/ui.c"
-	echo "Uruchom skrypt z katalogu glownego projektu albo skopiuj caly projekt na Raspberry Pi."
+if [[ ! -f "Makefile" || ! -f "src/main.cpp" || ! -f "src/clock.cpp" || ! -f "src/ui.cpp" ]]; then
+	echo "Błąd: brakuje plików projektu w katalogu: $SCRIPT_DIR"
+	echo "Wymagane: Makefile oraz src/main.cpp, src/clock.cpp, src/ui.cpp"
+	echo "Uruchom skrypt z katalogu głównego projektu albo skopiuj cały projekt na Raspberry Pi."
 	exit 1
 fi
 
