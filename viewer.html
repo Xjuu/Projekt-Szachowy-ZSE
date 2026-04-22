@@ -1,0 +1,977 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Chess · Live</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=Space+Mono:wght@400;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ═══════════════════════════════════════
+   PALETTE  #040F0F  #248232  #2BA84A  #2D3A3A  #FCFFFC
+═══════════════════════════════════════ */
+:root {
+  --c0: #040F0F;
+  --c1: #248232;
+  --c2: #2BA84A;
+  --c3: #2D3A3A;
+  --c4: #FCFFFC;
+
+  /* surfaces */
+  --bg:    #030c0c;
+  --sb:    #060f0f;
+  --card:  #0a1a1a;
+  --panel: #111e1e;
+  --hover: var(--c3);
+
+  /* borders */
+  --bd:  #0e2020;
+  --bd2: #162828;
+  --bd3: #1e3232;
+
+  /* green */
+  --g:     var(--c2);
+  --gd:    var(--c1);
+  --glow:  rgba(43,168,74,.20);
+  --gsoft: rgba(43,168,74,.08);
+
+  /* red */
+  --r:     #c94040;
+  --rd:    #7a2020;
+  --rglow: rgba(201,64,64,.25);
+  --rsoft: rgba(201,64,64,.08);
+
+  /* gold */
+  --gold: #c0a060;
+
+  /* text */
+  --t1: #FCFFFC;
+  --t2: rgba(252,255,252,.55);
+  --t3: rgba(252,255,252,.28);
+  --t4: rgba(252,255,252,.10);
+
+  /* board */
+  --sq-l:   #f0d9b5;
+  --sq-d:   #739160;
+  --sq-hll: #cdd26a;
+  --sq-hld: #aaa23a;
+
+  --sq: 58px;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  font-family: 'Inter', sans-serif;
+  background: var(--bg);
+  color: var(--t1);
+  display: flex;
+  height: 100vh;
+}
+::-webkit-scrollbar { width: 3px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--bd2); border-radius: 2px; }
+
+/* ═══════ SIDEBAR ═══════ */
+#sidebar {
+  width: 204px;
+  min-width: 204px;
+  background: var(--sb);
+  border-right: 1px solid var(--bd);
+  display: flex;
+  flex-direction: column;
+}
+
+#sb-head {
+  padding: 16px 14px 12px;
+  border-bottom: 1px solid var(--bd);
+}
+
+.sb-title {
+  font-family: 'Syne', sans-serif;
+  font-size: 1.05rem;
+  font-weight: 800;
+  color: var(--g);
+  letter-spacing: -.01em;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 6px;
+}
+
+.sb-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: .63rem;
+  color: var(--t3);
+  text-transform: uppercase;
+  letter-spacing: .07em;
+}
+
+#dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--t4);
+  transition: background .4s, box-shadow .4s;
+  flex-shrink: 0;
+}
+#dot.on  { background: var(--g);  box-shadow: 0 0 6px var(--glow); }
+#dot.err { background: var(--r);  box-shadow: 0 0 6px var(--rglow); }
+
+#glist { flex: 1; overflow-y: auto; padding: 6px 0; }
+
+.gi {
+  padding: 10px 14px;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+  transition: background .1s, border-color .1s;
+}
+.gi:hover  { background: var(--card); }
+.gi.sel    { background: var(--card); border-left-color: var(--g); }
+
+.gi-top {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 3px;
+}
+.gi-id {
+  font-family: 'Space Mono', monospace;
+  font-size: .68rem;
+  font-weight: 700;
+  color: var(--g);
+}
+.pill {
+  font-size: .54rem;
+  font-family: 'Space Mono', monospace;
+  padding: 1px 5px;
+  border-radius: 2px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.pill.ongoing   { background: rgba(43,168,74,.14);  color: var(--g); }
+.pill.checkmate { background: rgba(201,64,64,.14);  color: var(--r); }
+.pill.stalemate { background: rgba(192,160,96,.14); color: var(--gold); }
+.pill.timeout   { background: rgba(220,120,50,.14); color: #e09060; }
+
+.gi-vs   { font-size: .71rem; color: var(--t2); }
+.gi-date { font-size: .62rem; color: var(--t3); margin-top: 2px; }
+
+/* ═══════ MAIN ═══════ */
+#main { flex: 1; display: flex; overflow: hidden; min-width: 0; }
+
+/* placeholder */
+#ph {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+#ph-icon {
+  font-size: 80px;
+  color: var(--t4);
+  animation: float 3.5s ease-in-out infinite;
+  line-height: 1;
+}
+@keyframes float { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-9px)} }
+#ph p { font-size: .78rem; color: var(--t3); letter-spacing: .06em; text-transform: uppercase; }
+
+/* game view */
+#gview { flex: 1; display: none; overflow: hidden; }
+
+/* ═══════ CENTER (board + clocks) ═══════ */
+#center {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 14px 16px;
+  gap: 0;
+  width: calc(var(--sq)*8 + 52px);
+  overflow: hidden;
+}
+
+/* ── player strip ── */
+.strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 5px 9px 7px;
+  border-radius: 8px;
+  transition: background .25s;
+  position: relative;
+}
+.strip.active { background: rgba(43,168,74,.07); }
+.strip::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 8px; bottom: 8px;
+  width: 2px;
+  border-radius: 1px;
+  background: transparent;
+  transition: background .25s;
+}
+.strip.active::before { background: var(--g); }
+
+.avatar {
+  width: 34px; height: 34px;
+  border-radius: 8px;
+  background: var(--panel);
+  border: 1px solid var(--bd2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.1rem;
+  flex-shrink: 0;
+  user-select: none;
+  transition: border-color .25s;
+}
+.strip.active .avatar { border-color: var(--gd); }
+
+.pinfo { flex: 1; min-width: 0; }
+.pname {
+  font-size: .82rem;
+  font-weight: 600;
+  color: var(--t1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.2;
+}
+.psub {
+  font-size: .62rem;
+  color: var(--t3);
+  margin-top: 2px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  transition: color .25s;
+}
+.strip.active .psub { color: var(--gd); }
+
+/* ── CLOCK WIDGET ── */
+.clock {
+  flex-shrink: 0;
+  min-width: 104px;
+  background: var(--card);
+  border: 1px solid var(--bd2);
+  border-radius: 8px;
+  padding: 5px 14px 4px;
+  text-align: center;
+  position: relative;
+  overflow: hidden;
+  transition: border-color .25s, background .25s, box-shadow .25s;
+}
+/* progress bar at bottom */
+.clock::after {
+  content: '';
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  height: 2px;
+  background: var(--g);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform .3s;
+}
+.clock.tick {
+  border-color: var(--gd);
+  background: rgba(43,168,74,.07);
+  box-shadow: 0 0 0 1px rgba(43,168,74,.10);
+}
+.clock.tick::after { transform: scaleX(1); }
+.clock.low {
+  border-color: var(--rd);
+  background: rgba(201,64,64,.08);
+  box-shadow: 0 0 0 1px rgba(201,64,64,.16);
+  animation: ckpulse 1.1s ease-in-out infinite;
+}
+.clock.low::after { background: var(--r); transform: scaleX(1); }
+@keyframes ckpulse {
+  0%,100% { box-shadow: 0 0 0 1px rgba(201,64,64,.16); }
+  50%     { box-shadow: 0 0 14px rgba(201,64,64,.35), 0 0 0 1px rgba(201,64,64,.35); }
+}
+
+.ck-digits {
+  font-family: 'Space Mono', monospace;
+  font-size: 1.7rem;
+  font-weight: 700;
+  letter-spacing: .03em;
+  line-height: 1;
+  color: var(--t3);
+  transition: color .25s;
+  display: block;
+}
+.clock.tick .ck-digits { color: var(--g); }
+.clock.low  .ck-digits { color: var(--r); }
+
+.ck-label {
+  font-size: .56rem;
+  color: var(--t4);
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  margin-top: 2px;
+  transition: color .25s;
+}
+.clock.tick .ck-label { color: var(--gd); }
+.clock.low  .ck-label { color: var(--rd); }
+
+/* ── board ── */
+#board-wrap { display: flex; align-items: flex-start; padding: 2px 0; }
+#ranks {
+  display: flex;
+  flex-direction: column;
+  width: 20px;
+  flex-shrink: 0;
+}
+#ranks span {
+  height: var(--sq);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'Space Mono', monospace;
+  font-size: .57rem;
+  color: var(--t3);
+  user-select: none;
+}
+#bcol { display: flex; flex-direction: column; }
+#board {
+  display: grid;
+  grid-template-columns: repeat(8, var(--sq));
+  grid-template-rows:    repeat(8, var(--sq));
+  border: 2px solid var(--bd);
+  box-shadow: 0 0 0 1px rgba(255,255,255,.03), 0 14px 50px rgba(0,0,0,.7);
+}
+#files { display: flex; margin-top: 5px; padding-left: 20px; }
+#files span {
+  width: var(--sq);
+  text-align: center;
+  font-family: 'Space Mono', monospace;
+  font-size: .57rem;
+  color: var(--t3);
+  user-select: none;
+}
+.sq { width: var(--sq); height: var(--sq); display: flex; align-items: center; justify-content: center; font-size: calc(var(--sq)*.72); position: relative; user-select: none; }
+.sq.l  { background: var(--sq-l); }
+.sq.d  { background: var(--sq-d); }
+.sq.hl { background: var(--sq-hll); }
+.sq.d.hl { background: var(--sq-hld); }
+.pc { line-height: 1; cursor: default; pointer-events: none; }
+.pc.w { color: #fff; filter: drop-shadow(0 1px 2px rgba(0,0,0,.9)) drop-shadow(0 0 3px rgba(0,0,0,.5)); }
+.pc.b { color: #111; filter: drop-shadow(0 1px 2px rgba(255,255,255,.2)); }
+
+/* ── nav ── */
+#nav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  justify-content: center;
+  padding: 7px 4px 0;
+  flex-wrap: wrap;
+}
+.nb {
+  font-family: 'Space Mono', monospace;
+  font-size: .75rem;
+  background: var(--card);
+  border: 1px solid var(--bd2);
+  color: var(--t2);
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all .12s;
+  line-height: 1;
+}
+.nb:hover:not(:disabled) { background: var(--panel); border-color: var(--bd3); color: var(--t1); }
+.nb:disabled { opacity: .18; cursor: default; }
+.nb.live { background: var(--gsoft); border-color: var(--gd); color: var(--g); }
+.nb.live:hover { background: var(--glow); }
+#nav-n { font-family: 'Space Mono', monospace; font-size: .67rem; color: var(--t3); min-width: 50px; text-align: center; }
+
+/* ═══════ RIGHT PANEL ═══════ */
+#rpanel {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--bd);
+  overflow: hidden;
+}
+
+/* info bar */
+#rp-bar {
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--bd);
+  flex-shrink: 0;
+}
+
+.rp-row1 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+#rp-title {
+  font-family: 'Syne', sans-serif;
+  font-size: .95rem;
+  font-weight: 700;
+  color: var(--t2);
+}
+.stag {
+  font-family: 'Space Mono', monospace;
+  font-size: .57rem;
+  padding: 2px 7px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  border: 1px solid;
+}
+.stag.ongoing   { color: var(--g);    border-color: var(--gd);  background: rgba(43,168,74,.08); }
+.stag.checkmate { color: var(--r);    border-color: var(--rd);  background: rgba(201,64,64,.08); }
+.stag.stalemate { color: var(--gold); border-color: #5a4a10;    background: rgba(192,160,96,.08); }
+.stag.timeout   { color: #e09060;     border-color: #6a3010;    background: rgba(220,120,50,.08); }
+
+.rp-vs {
+  font-size: .76rem;
+  color: var(--t2);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.rp-vs .pw { color: rgba(240,217,181,.9); }
+.rp-vs .pb { color: rgba(115,145,96,.9); }
+.rp-vs .sep { color: var(--t3); }
+
+#rp-winner { font-size: .76rem; color: var(--gold); font-weight: 600; margin-top: 4px; }
+
+/* time display bar */
+#time-bar {
+  display: none;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 8px 12px;
+  background: var(--card);
+  border: 1px solid var(--bd2);
+  border-radius: 6px;
+}
+.tb-side {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+}
+.tb-piece { font-size: .9rem; opacity: .7; }
+.tb-name { font-size: .68rem; color: var(--t2); font-weight: 500; min-width: 40px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tb-time {
+  font-family: 'Space Mono', monospace;
+  font-size: .88rem;
+  font-weight: 700;
+  color: var(--t2);
+  transition: color .2s;
+}
+.tb-time.tick { color: var(--g); }
+.tb-time.low  { color: var(--r); }
+.tb-div { width: 1px; background: var(--bd2); align-self: stretch; margin: 2px 0; }
+
+/* move list */
+#mv-wrap { flex: 1; overflow-y: auto; }
+#mv-empty { padding: 28px; text-align: center; color: var(--t3); font-size: .75rem; display: none; }
+#mv-tbl { border-collapse: collapse; width: 100%; }
+#mv-tbl thead th {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--sb);
+  font-family: 'Space Mono', monospace;
+  font-size: .57rem;
+  text-transform: uppercase;
+  letter-spacing: .09em;
+  color: var(--t3);
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--bd);
+  text-align: left;
+  font-weight: 400;
+}
+#mv-tbl tbody tr { cursor: pointer; transition: background .08s; }
+#mv-tbl tbody tr:hover { background: var(--card); }
+#mv-tbl tbody tr.cur  { background: var(--panel); }
+#mv-tbl tbody td {
+  padding: 6px 14px;
+  vertical-align: middle;
+  border-bottom: 1px solid rgba(255,255,255,.025);
+}
+.tn  { font-family: 'Space Mono', monospace; font-size: .63rem; color: var(--t3); width: 26px; }
+.tts { font-family: 'Space Mono', monospace; font-size: .63rem; color: var(--t3); }
+.tp  { font-size: .72rem; font-weight: 500; }
+.tp.white { color: rgba(240,217,181,.75); }
+.tp.black { color: rgba(115,145,96,.85); }
+.tm  { font-family: 'Space Mono', monospace; font-size: .78rem; color: var(--t1); }
+</style>
+</head>
+<body>
+
+<!-- sidebar -->
+<div id="sidebar">
+  <div id="sb-head">
+    <div class="sb-title">♟ Chess</div>
+    <div class="sb-status">
+      <div id="dot"></div>
+      <span id="dot-lbl">connecting…</span>
+    </div>
+  </div>
+  <div id="glist"></div>
+</div>
+
+<!-- main -->
+<div id="main">
+  <div id="ph">
+    <div id="ph-icon">♞</div>
+    <p>Select a game</p>
+  </div>
+
+  <div id="gview">
+    <!-- center -->
+    <div id="center">
+
+      <!-- black -->
+      <div class="strip" id="str-b">
+        <div class="avatar">♚</div>
+        <div class="pinfo">
+          <div class="pname" id="pn-b">Black</div>
+          <div class="psub" id="ps-b">waiting</div>
+        </div>
+        <div class="clock" id="ck-b">
+          <span class="ck-digits" id="cd-b">—:——</span>
+          <div class="ck-label" id="cl-b">—</div>
+        </div>
+      </div>
+
+      <!-- board -->
+      <div id="board-wrap">
+        <div id="ranks">
+          <span>8</span><span>7</span><span>6</span><span>5</span>
+          <span>4</span><span>3</span><span>2</span><span>1</span>
+        </div>
+        <div id="bcol">
+          <div id="board"></div>
+          <div id="files">
+            <span>a</span><span>b</span><span>c</span><span>d</span>
+            <span>e</span><span>f</span><span>g</span><span>h</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- white -->
+      <div class="strip" id="str-w">
+        <div class="avatar">♔</div>
+        <div class="pinfo">
+          <div class="pname" id="pn-w">White</div>
+          <div class="psub" id="ps-w">waiting</div>
+        </div>
+        <div class="clock" id="ck-w">
+          <span class="ck-digits" id="cd-w">—:——</span>
+          <div class="ck-label" id="cl-w">—</div>
+        </div>
+      </div>
+
+      <!-- nav -->
+      <div id="nav">
+        <button class="nb" id="nb-f" onclick="goTo(0)">⏮</button>
+        <button class="nb" id="nb-p" onclick="goTo(curIdx-1)">◀</button>
+        <span id="nav-n">0 / 0</span>
+        <button class="nb" id="nb-n" onclick="goTo(curIdx+1)">▶</button>
+        <button class="nb" id="nb-l" onclick="goTo(states.length-1)">⏭</button>
+        <button class="nb live" id="nb-live" onclick="setLive(true)" style="display:none">● Live</button>
+      </div>
+
+    </div><!-- /center -->
+
+    <!-- right panel -->
+    <div id="rpanel">
+      <div id="rp-bar">
+        <div class="rp-row1">
+          <span id="rp-title">—</span>
+          <span id="rp-st" class="stag ongoing">ongoing</span>
+        </div>
+        <div class="rp-vs">
+          <span class="pw">♔ <span id="rp-w">White</span></span>
+          <span class="sep">vs</span>
+          <span class="pb">♚ <span id="rp-b">Black</span></span>
+        </div>
+        <div id="rp-winner"></div>
+        <!-- compact time display for the info bar -->
+        <div id="time-bar">
+          <div class="tb-side">
+            <span class="tb-piece">♔</span>
+            <span class="tb-name" id="tb-wn">White</span>
+            <span class="tb-time" id="tb-wt">—:——</span>
+          </div>
+          <div class="tb-div"></div>
+          <div class="tb-side">
+            <span class="tb-piece">♚</span>
+            <span class="tb-name" id="tb-bn">Black</span>
+            <span class="tb-time" id="tb-bt">—:——</span>
+          </div>
+        </div>
+      </div>
+
+      <div id="mv-wrap">
+        <div id="mv-empty">No moves yet</div>
+        <table id="mv-tbl">
+          <thead><tr>
+            <th class="tn">#</th>
+            <th class="tts">Time</th>
+            <th class="tp">Player</th>
+            <th class="tm">Move</th>
+          </tr></thead>
+          <tbody id="mv-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div><!-- /gview -->
+</div><!-- /main -->
+
+<script>
+/* ═══ PIECES & BOARD ═══ */
+var G={K:'♔',Q:'♕',R:'♖',B:'♗',N:'♘',P:'♙',k:'♚',q:'♛',r:'♜',b:'♝',n:'♞',p:'♟'};
+var INIT='rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR';
+
+function parseFEN(fen){
+  var b=[];
+  for(var i=0;i<8;i++) b.push(new Array(8).fill(null));
+  var rks=fen.split(' ')[0].split('/');
+  for(var r=0;r<8;r++){
+    var c=0;
+    for(var i=0;i<rks[r].length;i++){
+      var ch=rks[r][i];
+      if(ch>='1'&&ch<='8') c+=+ch;
+      else { b[r][c]=ch; c++; }
+    }
+  }
+  return b;
+}
+function sqn(r,c){ return String.fromCharCode(97+c)+(8-r); }
+function rcsq(s){ return [8-+s[1], s.charCodeAt(0)-97]; }
+function applyMove(bd,uci){
+  var b=bd.map(function(r){return r.slice();});
+  var f=rcsq(uci.slice(0,2)),t=rcsq(uci.slice(2,4));
+  var fr=f[0],fc=f[1],tr=t[0],tc=t[1];
+  var promo=uci.length>=5?uci[4]:null, pc=b[fr][fc];
+  if(!pc) return b;
+  if((pc==='P'||pc==='p')&&fc!==tc&&!b[tr][tc]) b[fr][tc]=null;
+  if(pc==='K'&&fr===7&&fc===4){if(tc===6){b[7][5]='R';b[7][7]=null;}else if(tc===2){b[7][3]='R';b[7][0]=null;}}
+  if(pc==='k'&&fr===0&&fc===4){if(tc===6){b[0][5]='r';b[0][7]=null;}else if(tc===2){b[0][3]='r';b[0][0]=null;}}
+  b[tr][tc]=promo?(pc===pc.toUpperCase()?promo.toUpperCase():promo.toLowerCase()):pc;
+  b[fr][fc]=null;
+  return b;
+}
+function buildStates(moves){
+  var arr=[parseFEN(INIT)];
+  moves.forEach(function(m){ arr.push(applyMove(arr[arr.length-1],m.move)); });
+  return arr;
+}
+function drawBoard(board,from,to){
+  var el=document.getElementById('board');
+  el.innerHTML='';
+  for(var r=0;r<8;r++){
+    for(var c=0;c<8;c++){
+      var d=document.createElement('div');
+      var s=sqn(r,c);
+      d.className='sq '+((r+c)%2===0?'l':'d')+(s===from||s===to?' hl':'');
+      var pc=board[r][c];
+      if(pc){
+        var sp=document.createElement('span');
+        sp.className='pc '+(pc===pc.toUpperCase()?'w':'b');
+        sp.textContent=G[pc]||pc;
+        d.appendChild(sp);
+      }
+      el.appendChild(d);
+    }
+  }
+}
+
+/* ═══════════════════════════════════════════════════
+   CLOCK SYSTEM
+   ─────────────────────────────────────────────────
+   State object C:
+     wMs, bMs  = remaining ms, snapshotted at C.ref
+     turn      = 'w' | 'b'
+     ref       = Date.now() at snapshot
+     going     = counting down?
+     hasTc     = game has time control?
+     _t        = setInterval handle
+
+   Two public functions:
+     clkSet(game)   — called on every game update from SSE/fetch
+     clkStop()      — called when deselecting a game
+═══════════════════════════════════════════════════ */
+var C={wMs:0,bMs:0,turn:'w',ref:0,going:false,hasTc:false,_t:null};
+
+function _fmt(ms){
+  if(ms<=0) return '0:00';
+  var s=Math.floor(ms/1000);
+  return Math.floor(s/60)+':'+(s%60<10?'0':'')+s%60;
+}
+
+/* Write all clock-related DOM elements.
+   Called by ticker (100ms) and immediately after every state change. */
+function _render(){
+  /* Compute live values by subtracting elapsed from active side */
+  var el = C.going ? Math.max(0, Date.now()-C.ref) : 0;
+  var w  = (C.turn==='w') ? Math.max(0, C.wMs-el) : C.wMs;
+  var b  = (C.turn==='b') ? Math.max(0, C.bMs-el) : C.bMs;
+
+  var wTick = C.going && C.turn==='w';
+  var bTick = C.going && C.turn==='b';
+  var wLow  = wTick && w>0 && w<30000;
+  var bLow  = bTick && b>0 && b<30000;
+
+  /* ── big clocks next to board ── */
+  var ckW=document.getElementById('ck-w');
+  var ckB=document.getElementById('ck-b');
+  if(ckW){
+    ckW.className='clock'+(wLow?' low':wTick?' tick':'');
+    document.getElementById('cd-w').textContent = C.hasTc ? _fmt(w) : '∞';
+    document.getElementById('cl-w').textContent = wTick?'to move':(C.hasTc?'waiting':'—');
+  }
+  if(ckB){
+    ckB.className='clock'+(bLow?' low':bTick?' tick':'');
+    document.getElementById('cd-b').textContent = C.hasTc ? _fmt(b) : '∞';
+    document.getElementById('cl-b').textContent = bTick?'to move':(C.hasTc?'waiting':'—');
+  }
+
+  /* ── compact time bar in right panel ── */
+  var tb=document.getElementById('time-bar');
+  if(tb){
+    tb.style.display = C.hasTc ? 'flex' : 'none';
+    var twEl=document.getElementById('tb-wt');
+    var tbEl=document.getElementById('tb-bt');
+    if(twEl){
+      twEl.textContent=_fmt(w);
+      twEl.className='tb-time'+(wLow?' low':wTick?' tick':'');
+    }
+    if(tbEl){
+      tbEl.textContent=_fmt(b);
+      tbEl.className='tb-time'+(bLow?' low':bTick?' tick':'');
+    }
+  }
+
+  /* ── player strips ── */
+  var sw=document.getElementById('str-w');
+  var sb=document.getElementById('str-b');
+  var over = curGame && curGame.status!=='ongoing';
+  if(sw){
+    sw.classList.toggle('active', wTick);
+    document.getElementById('ps-w').textContent = over ? curGame.status : (wTick?'to move':'waiting');
+  }
+  if(sb){
+    sb.classList.toggle('active', bTick);
+    document.getElementById('ps-b').textContent = over ? curGame.status : (bTick?'to move':'waiting');
+  }
+}
+
+function _startTick(){ if(!C._t) C._t=setInterval(_render,100); }
+function _stopTick() { if(C._t){ clearInterval(C._t); C._t=null; } }
+
+/* Snap current elapsed into wMs/bMs so values stay correct when pausing */
+function _snap(){
+  if(!C.going) return;
+  var el=Date.now()-C.ref;
+  if(C.turn==='w') C.wMs=Math.max(0,C.wMs-el);
+  else             C.bMs=Math.max(0,C.bMs-el);
+  C.ref=Date.now();
+}
+
+/* Public: sync clock from a game object received from server */
+function clkSet(game){
+  var tc = game.time_control  || 0;
+  var wm = game.white_time_ms || 0;
+  var bm = game.black_time_ms || 0;
+
+  C.hasTc = (tc>0 || wm>0 || bm>0);
+
+  if(!C.hasTc){
+    /* No timing data → stop ticker, show ∞ */
+    _stopTick();
+    C.going=false;
+    _render();
+    return;
+  }
+
+  /* Seed initial values from time_control when per-move data not yet arrived */
+  if(tc>0 && wm===0 && bm===0){
+    wm = tc*1000;
+    bm = tc*1000;
+  }
+
+  var newTurn = ((game.moves||[]).length % 2 === 0) ? 'w' : 'b';
+
+  /* If only turn changed (new move arrived), snap first */
+  if(newTurn !== C.turn) _snap();
+
+  C.wMs   = wm;
+  C.bMs   = bm;
+  C.turn  = newTurn;
+  C.ref   = Date.now();
+  C.going = (game.status==='ongoing');
+
+  if(C.going) _startTick(); else _stopTick();
+  _render();
+}
+
+/* Public: stop clock entirely (game deselected) */
+function clkStop(){
+  _stopTick();
+  C.going=false;
+  C.hasTc=false;
+  _render();
+}
+
+/* ═══ APP STATE ═══ */
+var selId=null, allGames=[], curGame=null, states=[], curIdx=0, isLive=true;
+
+/* ═══ BOARD NAV ═══ */
+function goTo(idx){
+  if(!states.length) return;
+  idx=Math.max(0,Math.min(idx,states.length-1));
+  curIdx=idx;
+  isLive=(idx===states.length-1);
+  document.getElementById('nb-live').className='nb'+(isLive?' live':'');
+  var from='',to='';
+  if(idx>0&&curGame&&curGame.moves&&curGame.moves[idx-1]){
+    var u=curGame.moves[idx-1].move; from=u.slice(0,2); to=u.slice(2,4);
+  }
+  drawBoard(states[idx],from,to);
+  var tot=states.length-1;
+  document.getElementById('nav-n').textContent=idx+' / '+tot;
+  document.getElementById('nb-p').disabled=idx===0;
+  document.getElementById('nb-f').disabled=idx===0;
+  document.getElementById('nb-n').disabled=idx===tot;
+  document.getElementById('nb-l').disabled=idx===tot;
+  document.querySelectorAll('#mv-body tr').forEach(function(r){r.classList.remove('cur');});
+  if(idx>0){
+    var row=document.querySelector('#mv-body tr[data-i="'+(idx-1)+'"]');
+    if(row){ row.classList.add('cur'); row.scrollIntoView({block:'nearest'}); }
+  }
+}
+function setLive(v){
+  isLive=v;
+  if(isLive) goTo(states.length-1);
+  document.getElementById('nb-live').className='nb'+(isLive?' live':'');
+}
+
+/* ═══ SIDEBAR ═══ */
+function renderSidebar(){
+  var list=document.getElementById('glist'), sc=list.scrollTop;
+  list.innerHTML='';
+  allGames.slice().reverse().forEach(function(g){
+    var d=document.createElement('div');
+    d.className='gi'+(g.id===selId?' sel':'');
+    d.dataset.id=g.id;
+    var bc={ongoing:'ongoing',checkmate:'checkmate',stalemate:'stalemate',timeout:'timeout'}[g.status]||'stalemate';
+    d.innerHTML=
+      '<div class="gi-top"><span class="gi-id">#'+g.id+'</span><span class="pill '+bc+'">'+g.status+'</span></div>'+
+      '<div class="gi-vs">'+(g.white_player||'White')+' vs '+(g.black_player||'Black')+'</div>'+
+      '<div class="gi-date">'+(g.created_at||'')+'</div>';
+    d.onclick=function(){ selectGame(g.id); };
+    list.appendChild(d);
+  });
+  list.scrollTop=sc;
+}
+
+/* ═══ GAME DETAIL ═══ */
+function renderDetail(game){
+  document.getElementById('ph').style.display='none';
+  document.getElementById('gview').style.display='flex';
+
+  /* names everywhere */
+  document.getElementById('pn-w').textContent = game.white_player||'White';
+  document.getElementById('pn-b').textContent = game.black_player||'Black';
+  document.getElementById('rp-w').textContent  = game.white_player||'White';
+  document.getElementById('rp-b').textContent  = game.black_player||'Black';
+  document.getElementById('tb-wn').textContent = game.white_player||'White';
+  document.getElementById('tb-bn').textContent = game.black_player||'Black';
+
+  document.getElementById('rp-title').textContent = 'Game #'+game.id;
+  var st=document.getElementById('rp-st');
+  st.textContent=game.status; st.className='stag '+(game.status||'ongoing');
+  document.getElementById('rp-winner').textContent=game.winner?'🏆 '+game.winner:'';
+  document.getElementById('nb-live').style.display=game.status==='ongoing'?'':'none';
+
+  /* board */
+  var prevLen=curGame?(curGame.moves?curGame.moves.length:0):-1;
+  var currLen=game.moves?game.moves.length:0;
+  var fresh=!curGame||curGame.id!==game.id;
+  curGame=game;
+
+  if(fresh){
+    states=buildStates(game.moves||[]);
+    curIdx=states.length-1;
+    isLive=true;
+  } else if(currLen!==prevLen){
+    states=buildStates(game.moves||[]);
+    if(isLive) curIdx=states.length-1;
+  }
+
+  /* move table */
+  var tbody=document.getElementById('mv-body');
+  tbody.innerHTML='';
+  var moves=game.moves||[];
+  document.getElementById('mv-empty').style.display=moves.length?'none':'block';
+  moves.forEach(function(m,i){
+    var cls=m.player==='White'?'white':'black';
+    var tr=document.createElement('tr'); tr.dataset.i=i;
+    if(i===curIdx-1) tr.classList.add('cur');
+    tr.innerHTML=
+      '<td class="tn">'+m.move_number+'</td>'+
+      '<td class="tts">'+m.timestamp+'</td>'+
+      '<td class="tp '+cls+'">'+m.player+'</td>'+
+      '<td class="tm">'+m.move+'</td>';
+    tr.onclick=(function(ii){return function(){goTo(ii+1);isLive=false;};})(i);
+    tbody.appendChild(tr);
+  });
+
+  goTo(curIdx);
+  clkSet(game);
+}
+
+/* ═══ GAME SELECTION ═══ */
+function selectGame(id){
+  selId=id; isLive=true; curGame=null;
+  clkStop();
+  document.querySelectorAll('.gi').forEach(function(el){el.classList.remove('sel');});
+  var el=document.querySelector('[data-id="'+id+'"]');
+  if(el) el.classList.add('sel');
+  fetch('/state?id='+id)
+    .then(function(r){return r.ok?r.json():null;})
+    .then(function(g){if(g) renderDetail(g);})
+    .catch(function(){});
+}
+
+/* ═══ SSE ═══ */
+function startSSE(){
+  var dot=document.getElementById('dot');
+  var lbl=document.getElementById('dot-lbl');
+  var es=new EventSource('/events');
+  es.onopen=function(){ dot.className='on'; lbl.textContent='live'; };
+  es.addEventListener('list',function(e){
+    try{ var gs=JSON.parse(e.data); if(gs){ allGames=gs; renderSidebar(); } }catch(err){}
+  });
+  es.addEventListener('game',function(e){
+    try{ var g=JSON.parse(e.data); if(g.id===selId) renderDetail(g); }catch(err){}
+  });
+  es.onerror=function(){ dot.className='err'; lbl.textContent='disconnected'; };
+}
+
+/* ═══ KEYBOARD ═══ */
+document.addEventListener('keydown',function(e){
+  if(e.target.tagName==='INPUT') return;
+  if(e.key==='ArrowLeft')  goTo(curIdx-1);
+  else if(e.key==='ArrowRight') goTo(curIdx+1);
+  else if(e.key==='Home')  goTo(0);
+  else if(e.key==='End')   goTo(states.length-1);
+  else if(e.key==='l'||e.key==='L') setLive(true);
+});
+
+startSSE();
+</script>
+</body>
+</html>

@@ -1,0 +1,1479 @@
+// =============================================================================
+//  Chess Clock Pi — Bluetooth <-> Go server middleman
+// =============================================================================
+//  This program runs on a Raspberry Pi (or any Linux box with Bluetooth + SDL2).
+//  It combines the chess clock that used to live in github/src/*.c (ported to
+//  C++), a Bluetooth RFCOMM server that receives moves from a paired phone, an
+//  on-screen QR code shown at startup that tells the phone how to connect, and
+//  the HTTP relay to server.go that was already in the original main.cpp.
+//
+//  Build:   make
+//  Run:     ./chess_pi  [server_ip[:port]]  [bt_channel]  [clock_code]  [api_key]
+//
+//  Auth:  clock_code = CHS-XXXX-XXXX-XXXX  (from `npm run generate`)
+//         api_key    = sk_...               (private key — required for move/newgame)
+//
+//  Bluetooth protocol (plain text, CRLF or LF separated):
+//      HELLO
+//      NEWGAME|WhiteName|BlackName|minutes|increment_seconds
+//      MOVE|<uci>                         e.g.  MOVE|e2e4
+//      PAUSE | RESUME | RESET
+//      ARBITER_STOP | ARBITER_RESUME
+//      ERROR|white|black                  records an arbiter-registered error
+//      BONUS|white|black|<ms>             arbiter time bonus
+//      QUIT
+//
+//  Replies from Pi to the phone:
+//      OK|<context>               ACK a command
+//      ERR|<reason>               parse / illegal-move error
+//      CLOCK|<whiteMs>|<blackMs>|<active>   periodic clock snapshot
+//      GAME_OVER|<winner>|<reason>          end of game
+// =============================================================================
+
+#include "chess-library/include/chess.hpp"
+
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_ttf.h>
+#include <qrencode.h>
+
+#include <bluetooth/bluetooth.h>
+#include <bluetooth/hci.h>
+#include <bluetooth/hci_lib.h>
+#include <bluetooth/rfcomm.h>
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <fstream>
+#include <iostream>
+#include <list>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace chess;
+using SteadyClock = std::chrono::steady_clock;
+using Ms          = std::chrono::milliseconds;
+
+// ─── Global configuration (constants) ────────────────────────────────────────
+
+enum {
+    WINDOW_WIDTH      = 1280,
+    WINDOW_HEIGHT     = 400,
+    START_MINUTES     = 5,
+    INCREMENT_SECONDS = 0,
+    FPS               = 60,
+    DEFAULT_BT_CHAN   = 1
+};
+
+// ─── Clock domain (ported from github/src/clock.[ch]) ───────────────────────
+
+enum TimeFormat { TIME_FORMAT_MM_SS, TIME_FORMAT_MM_SS_MS };
+
+struct PlayerClock {
+    uint32_t remaining_ms  = 0;
+    uint32_t increment_ms  = 0;
+    uint32_t total_time_ms = 0;
+    uint8_t  error_count   = 0;
+};
+
+enum ActiveSide { ACTIVE_LEFT = 0, ACTIVE_RIGHT = 1 };
+
+enum GameState {
+    STATE_SETUP,
+    STATE_PAUSED,
+    STATE_RUNNING,
+    STATE_STOPPED_BY_ARBITER,
+    STATE_FINISHED_DRAW,
+    STATE_FINISHED_LEFT_WIN,
+    STATE_FINISHED_RIGHT_WIN
+};
+
+struct ClockState {
+    PlayerClock left;
+    PlayerClock right;
+    ActiveSide  active     = ACTIVE_LEFT;
+    GameState   state      = STATE_PAUSED;
+    uint32_t    move_count = 0;
+};
+
+static void format_time(uint32_t ms, char* out, size_t out_len, TimeFormat fmt) {
+    uint32_t total_seconds = ms / 1000;
+    uint32_t minutes       = total_seconds / 60;
+    uint32_t seconds       = total_seconds % 60;
+    uint32_t milliseconds  = ms % 1000;
+
+    if (fmt == TIME_FORMAT_MM_SS) {
+        std::snprintf(out, out_len, "%02u:%02u", minutes, seconds);
+    } else {
+        if (minutes > 0) std::snprintf(out, out_len, "%02u:%02u", minutes, seconds);
+        else             std::snprintf(out, out_len, "%02u.%03u", seconds, milliseconds);
+    }
+}
+
+static void init_clock(ClockState* c, uint32_t start_ms, uint32_t increment_ms) {
+    c->left  = PlayerClock{start_ms, increment_ms, start_ms, 0};
+    c->right = PlayerClock{start_ms, increment_ms, start_ms, 0};
+    c->active     = ACTIVE_LEFT;
+    c->state      = STATE_PAUSED;
+    c->move_count = 0;
+}
+
+static void reset_clock(ClockState* c, uint32_t start_ms, uint32_t increment_ms) {
+    init_clock(c, start_ms, increment_ms);
+}
+
+static void pause_resume_clock(ClockState* c) {
+    if (c->state == STATE_FINISHED_DRAW      ||
+        c->state == STATE_FINISHED_LEFT_WIN  ||
+        c->state == STATE_FINISHED_RIGHT_WIN) return;
+    if (c->state == STATE_PAUSED)  c->state = STATE_RUNNING;
+    else if (c->state == STATE_RUNNING) c->state = STATE_PAUSED;
+}
+
+static void switch_side(ClockState* c, ActiveSide pressed) {
+    if (c->state != STATE_RUNNING) return;
+    if (pressed != c->active)      return;
+
+    PlayerClock* a = (c->active == ACTIVE_LEFT) ? &c->left : &c->right;
+    a->remaining_ms += a->increment_ms;
+    c->active = (c->active == ACTIVE_LEFT) ? ACTIVE_RIGHT : ACTIVE_LEFT;
+    c->move_count++;
+}
+
+static void update_clock(ClockState* c, uint32_t delta_ms) {
+    if (c->state != STATE_RUNNING) return;
+    PlayerClock* a = (c->active == ACTIVE_LEFT) ? &c->left : &c->right;
+    if (delta_ms >= a->remaining_ms) {
+        a->remaining_ms = 0;
+        c->state = (c->active == ACTIVE_LEFT) ? STATE_FINISHED_RIGHT_WIN
+                                              : STATE_FINISHED_LEFT_WIN;
+        return;
+    }
+    a->remaining_ms -= delta_ms;
+}
+
+static void stop_by_arbiter(ClockState* c) {
+    if (c->state == STATE_RUNNING || c->state == STATE_PAUSED)
+        c->state = STATE_STOPPED_BY_ARBITER;
+}
+
+static void resume_by_arbiter(ClockState* c) {
+    if (c->state == STATE_STOPPED_BY_ARBITER) c->state = STATE_PAUSED;
+}
+
+static void player_error(ClockState* c, ActiveSide who) {
+    PlayerClock* pc = (who == ACTIVE_LEFT) ? &c->left : &c->right;
+    pc->error_count++;
+    if (pc->error_count >= 2) {
+        c->state = (who == ACTIVE_LEFT) ? STATE_FINISHED_RIGHT_WIN
+                                        : STATE_FINISHED_LEFT_WIN;
+    }
+}
+
+static void add_bonus_time(ClockState* c, ActiveSide who, uint32_t bonus_ms) {
+    PlayerClock* pc = (who == ACTIVE_LEFT) ? &c->left : &c->right;
+    pc->remaining_ms += bonus_ms;
+}
+
+// ─── UI resources (ported from github/src/ui.[ch]) ──────────────────────────
+
+enum UIMode { UI_MODE_QR, UI_MODE_SETUP, UI_MODE_GAME, UI_MODE_HELP, UI_MODE_ARBITER };
+
+struct AppResources {
+    SDL_Window*   window       = nullptr;
+    SDL_Renderer* renderer     = nullptr;
+    TTF_Font*     font_xlarge  = nullptr;
+    TTF_Font*     font_large   = nullptr;
+    TTF_Font*     font_medium  = nullptr;
+    TTF_Font*     font_small   = nullptr;
+    UIMode        mode         = UI_MODE_QR;
+    uint32_t      setup_minutes   = START_MINUTES;
+    uint32_t      setup_increment = INCREMENT_SECONDS;
+    SDL_Texture*  qr_texture   = nullptr;
+    int           qr_w         = 0;
+    int           qr_h         = 0;
+    std::string   qr_payload;
+    std::string   bt_mac;
+    int           bt_channel   = DEFAULT_BT_CHAN;
+    std::string   bt_status    = "Oczekiwanie na polaczenie Bluetooth...";
+    std::string   server_info;
+};
+
+struct Button {
+    SDL_Rect    rect;
+    const char* label;
+    bool        hover;
+};
+
+static const SDL_Color COLOR_BG                 {20, 20, 25, 255};
+static const SDL_Color COLOR_FG                 {245, 245, 245, 255};
+static const SDL_Color COLOR_ACCENT             {41, 175, 117, 255};
+static const SDL_Color COLOR_ACTIVE             {100, 200, 150, 255};
+static const SDL_Color COLOR_INACTIVE           {60, 60, 70, 255};
+static const SDL_Color COLOR_BUTTON_HOVER       {80, 180, 130, 255};
+static const SDL_Color COLOR_BUTTON_NORMAL      {41, 175, 117, 255};
+static const SDL_Color COLOR_BUTTON_ERROR       {200, 70, 70, 255};
+static const SDL_Color COLOR_BUTTON_ERROR_HOVER {230, 100, 100, 255};
+static const SDL_Color COLOR_BUTTON_BONUS       {200, 180, 70, 255};
+static const SDL_Color COLOR_BUTTON_BONUS_HOVER {230, 210, 100, 255};
+static const SDL_Color COLOR_BUTTON_STOP        {150, 150, 150, 255};
+static const SDL_Color COLOR_BUTTON_STOP_HOVER  {180, 180, 180, 255};
+
+static SDL_Texture* render_text_texture(SDL_Renderer* r, TTF_Font* f,
+                                        const char* text, SDL_Color color,
+                                        int* w, int* h) {
+    SDL_Surface* s = TTF_RenderUTF8_Blended(f, text, color);
+    if (!s) return nullptr;
+    SDL_Texture* t = SDL_CreateTextureFromSurface(r, s);
+    if (t) { *w = s->w; *h = s->h; }
+    SDL_FreeSurface(s);
+    return t;
+}
+
+static void draw_filled_rounded_rect(SDL_Renderer* r, SDL_Rect rect,
+                                     int radius, SDL_Color color) {
+    SDL_SetRenderDrawColor(r, color.r, color.g, color.b, color.a);
+    SDL_Rect fill = {rect.x + radius, rect.y, rect.w - 2 * radius, rect.h};
+    SDL_RenderFillRect(r, &fill);
+    fill = SDL_Rect{rect.x, rect.y + radius, rect.w, rect.h - 2 * radius};
+    SDL_RenderFillRect(r, &fill);
+    for (int i = -radius; i <= radius; i++) {
+        for (int j = -radius; j <= radius; j++) {
+            if (i*i + j*j <= radius*radius) {
+                SDL_RenderDrawPoint(r, rect.x + radius + i, rect.y + radius + j);
+                SDL_RenderDrawPoint(r, rect.x + (rect.w - radius) + i, rect.y + radius + j);
+                SDL_RenderDrawPoint(r, rect.x + radius + i, rect.y + (rect.h - radius) + j);
+                SDL_RenderDrawPoint(r, rect.x + (rect.w - radius) + i, rect.y + (rect.h - radius) + j);
+            }
+        }
+    }
+}
+
+static void draw_button(SDL_Renderer* r, TTF_Font* f, Button* b, bool hover) {
+    SDL_Color bg = hover ? COLOR_BUTTON_HOVER : COLOR_BUTTON_NORMAL;
+    draw_filled_rounded_rect(r, b->rect, 8, bg);
+    int tw = 0, th = 0;
+    SDL_Texture* tx = render_text_texture(r, f, b->label, COLOR_FG, &tw, &th);
+    if (tx) {
+        SDL_Rect dst{b->rect.x + (b->rect.w - tw)/2,
+                     b->rect.y + (b->rect.h - th)/2, tw, th};
+        SDL_RenderCopy(r, tx, nullptr, &dst);
+        SDL_DestroyTexture(tx);
+    }
+}
+
+static void draw_colored_button(SDL_Renderer* r, TTF_Font* f, Button* b,
+                                SDL_Color normal, SDL_Color hover, bool is_hover) {
+    SDL_Color bg = is_hover ? hover : normal;
+    draw_filled_rounded_rect(r, b->rect, 8, bg);
+    int tw = 0, th = 0;
+    SDL_Texture* tx = render_text_texture(r, f, b->label, COLOR_FG, &tw, &th);
+    if (tx) {
+        SDL_Rect dst{b->rect.x + (b->rect.w - tw)/2,
+                     b->rect.y + (b->rect.h - th)/2, tw, th};
+        SDL_RenderCopy(r, tx, nullptr, &dst);
+        SDL_DestroyTexture(tx);
+    }
+}
+
+static void draw_close_button(SDL_Renderer* r, TTF_Font* f) {
+    SDL_Rect close_rect{WINDOW_WIDTH - 55, 10, 45, 45};
+    draw_filled_rounded_rect(r, close_rect, 8, COLOR_BUTTON_ERROR);
+    int tw = 0, th = 0;
+    SDL_Texture* tx = render_text_texture(r, f, "X", COLOR_FG, &tw, &th);
+    if (tx) {
+        SDL_Rect dst{close_rect.x + (close_rect.w - tw)/2,
+                     close_rect.y + (close_rect.h - th)/2, tw, th};
+        SDL_RenderCopy(r, tx, nullptr, &dst);
+        SDL_DestroyTexture(tx);
+    }
+}
+
+// ─── QR code rendering ──────────────────────────────────────────────────────
+
+static SDL_Texture* make_qr_texture(SDL_Renderer* r, const std::string& text,
+                                    int pixel_size, int* out_w, int* out_h) {
+    QRcode* code = QRcode_encodeString(text.c_str(), 0, QR_ECLEVEL_M, QR_MODE_8, 1);
+    if (!code) return nullptr;
+
+    const int size   = code->width;
+    const int margin = 4;
+    const int imgSize = (size + margin * 2) * pixel_size;
+
+    SDL_Surface* s = SDL_CreateRGBSurfaceWithFormat(0, imgSize, imgSize, 32,
+                                                    SDL_PIXELFORMAT_RGBA32);
+    if (!s) { QRcode_free(code); return nullptr; }
+
+    SDL_FillRect(s, nullptr, SDL_MapRGBA(s->format, 255, 255, 255, 255));
+    uint32_t black = SDL_MapRGBA(s->format, 0, 0, 0, 255);
+    uint32_t* px = static_cast<uint32_t*>(s->pixels);
+
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            if (code->data[y * size + x] & 1) {
+                for (int dy = 0; dy < pixel_size; dy++) {
+                    for (int dx = 0; dx < pixel_size; dx++) {
+                        int xx = (margin + x) * pixel_size + dx;
+                        int yy = (margin + y) * pixel_size + dy;
+                        px[yy * imgSize + xx] = black;
+                    }
+                }
+            }
+        }
+    }
+
+    SDL_Texture* tex = SDL_CreateTextureFromSurface(r, s);
+    if (out_w) *out_w = imgSize;
+    if (out_h) *out_h = imgSize;
+    SDL_FreeSurface(s);
+    QRcode_free(code);
+    return tex;
+}
+
+// ─── Screen drawing ─────────────────────────────────────────────────────────
+
+static void draw_qr_screen(SDL_Renderer* r, AppResources* a) {
+    SDL_SetRenderDrawColor(r, COLOR_BG.r, COLOR_BG.g, COLOR_BG.b, COLOR_BG.a);
+    SDL_RenderClear(r);
+
+    int tw = 0, th = 0;
+
+    SDL_Texture* title = render_text_texture(r, a->font_medium,
+        "ZESKANUJ ABY POLACZYC", COLOR_ACCENT, &tw, &th);
+    if (title) {
+        SDL_Rect dst{20, 15, tw, th};
+        SDL_RenderCopy(r, title, nullptr, &dst);
+        SDL_DestroyTexture(title);
+    }
+
+    if (a->qr_texture) {
+        int qr_draw_h = WINDOW_HEIGHT - 70;
+        int qr_draw_w = qr_draw_h;
+        SDL_Rect dst{20, 60, qr_draw_w, qr_draw_h};
+        SDL_RenderCopy(r, a->qr_texture, nullptr, &dst);
+    }
+
+    int text_x = 20 + (WINDOW_HEIGHT - 70) + 40;
+
+    auto draw_line = [&](TTF_Font* font, const std::string& text, int y, SDL_Color c) {
+        SDL_Texture* t = render_text_texture(r, font, text.c_str(), c, &tw, &th);
+        if (t) {
+            SDL_Rect dst{text_x, y, tw, th};
+            SDL_RenderCopy(r, t, nullptr, &dst);
+            SDL_DestroyTexture(t);
+        }
+    };
+
+    int y = 70;
+    draw_line(a->font_medium, "Krok 1: Sparuj telefon z tym Pi", y, COLOR_FG); y += 36;
+    draw_line(a->font_small,  "(Ustawienia -> Bluetooth -> chess-clock-pi)", y, COLOR_FG); y += 26;
+    draw_line(a->font_medium, "Krok 2: Otworz 'Serial Bluetooth Terminal'", y, COLOR_FG); y += 36;
+    draw_line(a->font_small,  "lub aplikacje ktora skanuje QR i laczy RFCOMM.", y, COLOR_FG); y += 30;
+
+    draw_line(a->font_small, ("MAC: " + a->bt_mac).c_str(), y, COLOR_ACCENT); y += 22;
+    char chbuf[32]; std::snprintf(chbuf, sizeof(chbuf), "Kanal RFCOMM: %d", a->bt_channel);
+    draw_line(a->font_small, chbuf, y, COLOR_ACCENT); y += 22;
+    if (!a->server_info.empty()) {
+        draw_line(a->font_small, ("Serwer: " + a->server_info).c_str(), y, COLOR_FG);
+        y += 22;
+    }
+
+    draw_line(a->font_small, a->bt_status, WINDOW_HEIGHT - 30,
+              SDL_Color{200, 150, 80, 255});
+
+    draw_close_button(r, a->font_small);
+    SDL_RenderPresent(r);
+}
+
+static void draw_setup_screen(SDL_Renderer* r, AppResources* a) {
+    SDL_SetRenderDrawColor(r, COLOR_BG.r, COLOR_BG.g, COLOR_BG.b, COLOR_BG.a);
+    SDL_RenderClear(r);
+    int tw = 0, th = 0;
+
+    draw_close_button(r, a->font_small);
+
+    SDL_Texture* title = render_text_texture(r, a->font_medium,
+        "ZEGAR SZACHOWY", COLOR_ACCENT, &tw, &th);
+    SDL_Rect tr{10, 10, tw, th};
+    SDL_RenderCopy(r, title, nullptr, &tr);
+    SDL_DestroyTexture(title);
+
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "Czas: %um", a->setup_minutes);
+    SDL_Texture* mt = render_text_texture(r, a->font_small, buf, COLOR_FG, &tw, &th);
+    SDL_Rect ml{340, 30, tw, th}; SDL_RenderCopy(r, mt, nullptr, &ml);
+    SDL_DestroyTexture(mt);
+
+    Button minus_time{{330, 60, 40, 35}, "-", false};
+    Button plus_time {{440, 60, 40, 35}, "+", false};
+    draw_button(r, a->font_small, &minus_time, false);
+    draw_button(r, a->font_small, &plus_time,  false);
+
+    std::snprintf(buf, sizeof(buf), "Inc: %us", a->setup_increment);
+    SDL_Texture* it = render_text_texture(r, a->font_small, buf, COLOR_FG, &tw, &th);
+    SDL_Rect il{810, 30, tw, th}; SDL_RenderCopy(r, it, nullptr, &il);
+    SDL_DestroyTexture(it);
+
+    Button minus_inc{{810, 60, 40, 35}, "-", false};
+    Button plus_inc {{920, 60, 40, 35}, "+", false};
+    draw_button(r, a->font_small, &minus_inc, false);
+    draw_button(r, a->font_small, &plus_inc,  false);
+
+    Button start_btn{{340, 130, 300, 70}, "ROZP. GRE", false};
+    draw_button(r, a->font_medium, &start_btn, false);
+
+    SDL_Texture* help = render_text_texture(r, a->font_small,
+        "Kliknij +/- aby ustawic, potem START  (telefon moze wyslac NEWGAME)",
+        SDL_Color{150,150,150,255}, &tw, &th);
+    if (help) {
+        SDL_Rect dst{(WINDOW_WIDTH - tw)/2, WINDOW_HEIGHT - 45, tw, th};
+        SDL_RenderCopy(r, help, nullptr, &dst);
+        SDL_DestroyTexture(help);
+    }
+
+    SDL_RenderPresent(r);
+}
+
+static void draw_time_display(SDL_Renderer* r, TTF_Font* time_font, TTF_Font* lbl_font,
+                              const char* label, uint32_t ms, SDL_Rect rect,
+                              bool active, bool winner) {
+    SDL_Color bg = winner ? COLOR_ACCENT : (active ? COLOR_ACTIVE : COLOR_INACTIVE);
+    draw_filled_rounded_rect(r, rect, 12, bg);
+
+    char tbuf[16];
+    format_time(ms, tbuf, sizeof(tbuf), TIME_FORMAT_MM_SS_MS);
+
+    int tw = 0, th = 0;
+    SDL_Texture* tx = render_text_texture(r, time_font, tbuf, COLOR_FG, &tw, &th);
+    if (tx) {
+        SDL_Rect dst{rect.x + (rect.w - tw)/2, rect.y + 40, tw, th};
+        SDL_RenderCopy(r, tx, nullptr, &dst);
+        SDL_DestroyTexture(tx);
+    }
+    SDL_Texture* lbl = render_text_texture(r, lbl_font, label, COLOR_FG, &tw, &th);
+    if (lbl) {
+        SDL_Rect dst{rect.x + (rect.w - tw)/2, rect.y + 10, tw, th};
+        SDL_RenderCopy(r, lbl, nullptr, &dst);
+        SDL_DestroyTexture(lbl);
+    }
+}
+
+static void draw_status_bar(SDL_Renderer* r, TTF_Font* f, const ClockState* c) {
+    const char* txt = "";
+    SDL_Color col = COLOR_FG;
+    switch (c->state) {
+        case STATE_STOPPED_BY_ARBITER: txt = "ZATRZYMANO PRZEZ ARBITRA"; col = {255,165,0,255}; break;
+        case STATE_RUNNING:            txt = "GRA TRWA"; col = COLOR_ACCENT; break;
+        case STATE_PAUSED:             txt = "PAUZA"; col = {200,150,80,255}; break;
+        case STATE_FINISHED_LEFT_WIN:  txt = "BIALY WYGRAL!"; col = COLOR_ACCENT; break;
+        case STATE_FINISHED_RIGHT_WIN: txt = "CZARNY WYGRAL!"; col = COLOR_ACCENT; break;
+        case STATE_FINISHED_DRAW:      txt = "REMIS"; col = COLOR_ACCENT; break;
+        default: break;
+    }
+    int tw = 0, th = 0;
+    SDL_Texture* t = render_text_texture(r, f, txt, col, &tw, &th);
+    if (t) {
+        SDL_Rect d{(WINDOW_WIDTH - tw)/2, 30, tw, th};
+        SDL_RenderCopy(r, t, nullptr, &d);
+        SDL_DestroyTexture(t);
+    }
+    char info[64];
+    std::snprintf(info, sizeof(info), "Ruch: %u | B:%u | C:%u",
+                  c->move_count, c->left.error_count, c->right.error_count);
+    SDL_Texture* it = render_text_texture(r, f, info, COLOR_FG, &tw, &th);
+    if (it) {
+        SDL_Rect d{WINDOW_WIDTH - 250, 35, tw, th};
+        SDL_RenderCopy(r, it, nullptr, &d);
+        SDL_DestroyTexture(it);
+    }
+}
+
+static void draw_game_screen(SDL_Renderer* r, AppResources* a, const ClockState* c) {
+    SDL_SetRenderDrawColor(r, COLOR_BG.r, COLOR_BG.g, COLOR_BG.b, COLOR_BG.a);
+    SDL_RenderClear(r);
+
+    draw_status_bar(r, a->font_small, c);
+
+    SDL_Rect left_rect {20,  80, 600, 220};
+    SDL_Rect right_rect{660, 80, 600, 220};
+    bool left_winner  = c->state == STATE_FINISHED_LEFT_WIN;
+    bool right_winner = c->state == STATE_FINISHED_RIGHT_WIN;
+    bool left_active  = c->active == ACTIVE_LEFT  && c->state == STATE_RUNNING;
+    bool right_active = c->active == ACTIVE_RIGHT && c->state == STATE_RUNNING;
+
+    draw_time_display(r, a->font_xlarge, a->font_small, "BIALY",
+                      c->left.remaining_ms,  left_rect,  left_active,  left_winner);
+    draw_time_display(r, a->font_xlarge, a->font_small, "CZARNY",
+                      c->right.remaining_ms, right_rect, right_active, right_winner);
+
+    Button pause_btn {{ 50, 325, 120, 60},
+                      (c->state == STATE_PAUSED) ? "START" : "PAUZA", false};
+    Button reset_btn {{200, 325, 100, 60}, "RESET", false};
+    Button arbiter_btn{{350, 325, 150, 60}, "ARBITER", false};
+    draw_button(r, a->font_medium, &pause_btn,   false);
+    draw_button(r, a->font_medium, &reset_btn,   false);
+    draw_button(r, a->font_medium, &arbiter_btn, false);
+
+    draw_close_button(r, a->font_small);
+
+    SDL_SetRenderDrawColor(r, COLOR_ACCENT.r, COLOR_ACCENT.g, COLOR_ACCENT.b, COLOR_ACCENT.a);
+    SDL_Rect help_box{1230, 365, 50, 35};
+    SDL_RenderFillRect(r, &help_box);
+    int tw = 0, th = 0;
+    SDL_Texture* h = render_text_texture(r, a->font_small, "?", COLOR_BG, &tw, &th);
+    if (h) {
+        SDL_Rect d{1230 + (50 - tw)/2, 365 + (35 - th)/2, tw, th};
+        SDL_RenderCopy(r, h, nullptr, &d);
+        SDL_DestroyTexture(h);
+    }
+
+    SDL_RenderPresent(r);
+}
+
+static void draw_help_screen(SDL_Renderer* r, AppResources* a) {
+    SDL_SetRenderDrawColor(r, COLOR_BG.r, COLOR_BG.g, COLOR_BG.b, COLOR_BG.a);
+    SDL_RenderClear(r);
+    int tw = 0, th = 0;
+
+    draw_close_button(r, a->font_small);
+
+    SDL_Texture* t = render_text_texture(r, a->font_medium, "POMOC", COLOR_ACCENT, &tw, &th);
+    SDL_Rect tr{20, 10, tw, th}; SDL_RenderCopy(r, t, nullptr, &tr);
+    SDL_DestroyTexture(t);
+
+    SDL_Texture* h1 = render_text_texture(r, a->font_small, "Gracze:", COLOR_ACCENT, &tw, &th);
+    SDL_Rect r1{20, 60, tw, th}; SDL_RenderCopy(r, h1, nullptr, &r1);
+    SDL_DestroyTexture(h1);
+
+    const char* pl[] = {
+        "Lewa polowa: BIALY",
+        "Prawa polowa: CZARNY",
+        "SPACJA: Pauza",
+        "R: Reset",
+        "H/ESC: Menu"
+    };
+    int y = 85;
+    for (int i = 0; i < 5; i++) {
+        SDL_Texture* ln = render_text_texture(r, a->font_small, pl[i], COLOR_FG, &tw, &th);
+        if (ln) { SDL_Rect d{30, y, tw, th}; SDL_RenderCopy(r, ln, nullptr, &d);
+                  SDL_DestroyTexture(ln); }
+        y += 25;
+    }
+
+    SDL_Texture* h2 = render_text_texture(r, a->font_small, "Arbitra:", COLOR_ACCENT, &tw, &th);
+    SDL_Rect r2{650, 60, tw, th}; SDL_RenderCopy(r, h2, nullptr, &r2);
+    SDL_DestroyTexture(h2);
+
+    const char* al[] = {
+        "A: Stop/Q: Wznow",
+        "1/2: Blad B/C",
+        "3/4: +2min B/C"
+    };
+    y = 85;
+    for (int i = 0; i < 3; i++) {
+        SDL_Texture* ln = render_text_texture(r, a->font_small, al[i], COLOR_FG, &tw, &th);
+        if (ln) { SDL_Rect d{660, y, tw, th}; SDL_RenderCopy(r, ln, nullptr, &d);
+                  SDL_DestroyTexture(ln); }
+        y += 25;
+    }
+
+    SDL_Texture* f = render_text_texture(r, a->font_small, "ESC: Powrot do gry",
+                                          SDL_Color{150,150,150,255}, &tw, &th);
+    if (f) {
+        SDL_Rect d{(WINDOW_WIDTH - tw)/2, WINDOW_HEIGHT - 40, tw, th};
+        SDL_RenderCopy(r, f, nullptr, &d);
+        SDL_DestroyTexture(f);
+    }
+    SDL_RenderPresent(r);
+}
+
+static void draw_arbiter_menu(SDL_Renderer* r, AppResources* a, const ClockState* c) {
+    SDL_SetRenderDrawColor(r, COLOR_BG.r, COLOR_BG.g, COLOR_BG.b, COLOR_BG.a);
+    SDL_RenderClear(r);
+    int tw = 0, th = 0;
+
+    draw_close_button(r, a->font_small);
+
+    SDL_Texture* title = render_text_texture(r, a->font_medium, "MENU ARBITRA",
+                                             COLOR_ACCENT, &tw, &th);
+    SDL_Rect tr{20, 20, tw, th}; SDL_RenderCopy(r, title, nullptr, &tr);
+    SDL_DestroyTexture(title);
+
+    const char* stop_label = (c->state == STATE_STOPPED_BY_ARBITER) ? "WZNOW" : "STOP";
+    Button stop_btn   {{ 80,  90, 220, 65}, stop_label,    false};
+    Button error_w    {{350,  90, 220, 65}, "BLAD BIALY",  false};
+    Button error_b    {{620,  90, 220, 65}, "BLAD CZARNY", false};
+    Button bonus_w    {{ 80, 175, 220, 65}, "+2MIN BIALY", false};
+    Button bonus_b    {{350, 175, 220, 65}, "+2MIN CZARNY",false};
+    Button close_btn  {{620, 175, 220, 65}, "ZAMKNIJ",     false};
+
+    draw_colored_button(r, a->font_small, &stop_btn,  COLOR_BUTTON_NORMAL,      COLOR_BUTTON_HOVER,       false);
+    draw_colored_button(r, a->font_small, &error_w,   COLOR_BUTTON_ERROR,       COLOR_BUTTON_ERROR_HOVER, false);
+    draw_colored_button(r, a->font_small, &error_b,   COLOR_BUTTON_ERROR,       COLOR_BUTTON_ERROR_HOVER, false);
+    draw_colored_button(r, a->font_small, &bonus_w,   COLOR_BUTTON_BONUS,       COLOR_BUTTON_BONUS_HOVER, false);
+    draw_colored_button(r, a->font_small, &bonus_b,   COLOR_BUTTON_BONUS,       COLOR_BUTTON_BONUS_HOVER, false);
+    draw_colored_button(r, a->font_small, &close_btn, COLOR_BUTTON_STOP,        COLOR_BUTTON_STOP_HOVER,  false);
+
+    char info[64];
+    std::snprintf(info, sizeof(info), "B: %u bledy | C: %u bledy",
+                  c->left.error_count, c->right.error_count);
+    SDL_Texture* it = render_text_texture(r, a->font_small, info, COLOR_FG, &tw, &th);
+    if (it) { SDL_Rect d{20, 270, tw, th}; SDL_RenderCopy(r, it, nullptr, &d);
+              SDL_DestroyTexture(it); }
+
+    SDL_RenderPresent(r);
+}
+
+// ─── UI init / cleanup ──────────────────────────────────────────────────────
+
+static bool init_sdl_and_ttf() {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
+        std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
+        return false;
+    }
+    if (TTF_Init() != 0) {
+        std::fprintf(stderr, "TTF_Init: %s\n", TTF_GetError());
+        SDL_Quit();
+        return false;
+    }
+    return true;
+}
+
+static bool create_window_and_renderer(AppResources* a) {
+    a->window = SDL_CreateWindow("Chess Clock Pi",
+                                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                 WINDOW_WIDTH, WINDOW_HEIGHT,
+                                 SDL_WINDOW_FULLSCREEN_DESKTOP);
+    if (!a->window) { std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return false; }
+    a->renderer = SDL_CreateRenderer(a->window, -1,
+        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!a->renderer) { std::fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError()); return false; }
+    return true;
+}
+
+static bool load_fonts(AppResources* a) {
+    const char* path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+    a->font_xlarge = TTF_OpenFont(path, 72);
+    a->font_large  = TTF_OpenFont(path, 36);
+    a->font_medium = TTF_OpenFont(path, 24);
+    a->font_small  = TTF_OpenFont(path, 16);
+    if (!a->font_xlarge || !a->font_large || !a->font_medium || !a->font_small) {
+        std::fprintf(stderr, "TTF_OpenFont failed: %s\n", TTF_GetError());
+        return false;
+    }
+    return true;
+}
+
+static void ui_cleanup(AppResources* a) {
+    if (a->qr_texture)  SDL_DestroyTexture(a->qr_texture);
+    if (a->font_xlarge) TTF_CloseFont(a->font_xlarge);
+    if (a->font_large)  TTF_CloseFont(a->font_large);
+    if (a->font_medium) TTF_CloseFont(a->font_medium);
+    if (a->font_small)  TTF_CloseFont(a->font_small);
+    if (a->renderer)    SDL_DestroyRenderer(a->renderer);
+    if (a->window)      SDL_DestroyWindow(a->window);
+    TTF_Quit();
+    SDL_Quit();
+}
+
+static bool ui_init(AppResources* a) {
+    if (!init_sdl_and_ttf()) return false;
+    if (!create_window_and_renderer(a) || !load_fonts(a)) { ui_cleanup(a); return false; }
+    a->mode            = UI_MODE_QR;
+    a->setup_minutes   = START_MINUTES;
+    a->setup_increment = INCREMENT_SECONDS;
+    return true;
+}
+
+// ─── Event handling (mouse + keyboard) ──────────────────────────────────────
+
+static void handle_setup_events(ClockState* c, AppResources* a,
+                                const SDL_Event* e, bool* running) {
+    if (e->type == SDL_QUIT) { *running = false; return; }
+    if (e->type == SDL_KEYDOWN) {
+        if (e->key.keysym.sym == SDLK_ESCAPE) *running = false;
+        return;
+    }
+    if (e->type != SDL_MOUSEBUTTONDOWN) return;
+    int x = e->button.x, y = e->button.y;
+    if (x >= WINDOW_WIDTH - 55 && x <= WINDOW_WIDTH && y >= 10 && y <= 55) {
+        *running = false; return;
+    }
+    if (x >= 330 && x < 370 && y >= 60 && y < 95) { if (a->setup_minutes > 1)  a->setup_minutes--; return; }
+    if (x >= 440 && x < 480 && y >= 60 && y < 95) { if (a->setup_minutes < 60) a->setup_minutes++; return; }
+    if (x >= 810 && x < 850 && y >= 60 && y < 95) { if (a->setup_increment > 0)  a->setup_increment--; return; }
+    if (x >= 920 && x < 960 && y >= 60 && y < 95) { if (a->setup_increment < 30) a->setup_increment++; return; }
+    if (x >= 340 && x <= 640 && y >= 130 && y <= 200) {
+        uint32_t start_ms = a->setup_minutes * 60 * 1000;
+        uint32_t inc_ms   = a->setup_increment * 1000;
+        init_clock(c, start_ms, inc_ms);
+        a->mode = UI_MODE_GAME;
+        c->state = STATE_PAUSED;
+    }
+}
+
+static void handle_game_events(ClockState* c, AppResources* a,
+                               const SDL_Event* e, bool* running) {
+    if (e->type == SDL_QUIT) { *running = false; return; }
+    if (e->type == SDL_KEYDOWN) {
+        switch (e->key.keysym.sym) {
+            case SDLK_ESCAPE: a->mode = UI_MODE_SETUP; return;
+            case SDLK_h:      a->mode = UI_MODE_HELP;  return;
+            case SDLK_SPACE:  pause_resume_clock(c);   return;
+            case SDLK_r: {
+                uint32_t s = a->setup_minutes * 60 * 1000;
+                uint32_t i = a->setup_increment * 1000;
+                reset_clock(c, s, i); return;
+            }
+            case SDLK_a: stop_by_arbiter(c);   return;
+            case SDLK_q: resume_by_arbiter(c); return;
+            case SDLK_1: player_error(c, ACTIVE_LEFT);  return;
+            case SDLK_2: player_error(c, ACTIVE_RIGHT); return;
+            case SDLK_3: add_bonus_time(c, ACTIVE_LEFT,  2000); return;
+            case SDLK_4: add_bonus_time(c, ACTIVE_RIGHT, 2000); return;
+        }
+        return;
+    }
+    if (e->type != SDL_MOUSEBUTTONDOWN) return;
+    int x = e->button.x, y = e->button.y;
+    if (x >= WINDOW_WIDTH - 55 && x <= WINDOW_WIDTH && y >= 10 && y <= 55) {
+        *running = false; return;
+    }
+    if (x >= 1230 && x <= 1280 && y >= 365 && y <= 400) { a->mode = UI_MODE_HELP; return; }
+    if (x >=   50 && x <=  170 && y >= 325 && y <= 385) { pause_resume_clock(c); return; }
+    if (x >=  200 && x <=  300 && y >= 325 && y <= 385) {
+        uint32_t s = a->setup_minutes * 60 * 1000;
+        uint32_t i = a->setup_increment * 1000;
+        reset_clock(c, s, i); return;
+    }
+    if (x >= 350 && x <= 500 && y >= 325 && y <= 385) { a->mode = UI_MODE_ARBITER; return; }
+
+    ActiveSide side = (x < WINDOW_WIDTH / 2) ? ACTIVE_LEFT : ACTIVE_RIGHT;
+    switch_side(c, side);
+}
+
+static void handle_arbiter_events(ClockState* c, AppResources* a,
+                                  const SDL_Event* e, bool* running) {
+    if (e->type == SDL_QUIT) { *running = false; return; }
+    if (e->type == SDL_KEYDOWN) {
+        if (e->key.keysym.sym == SDLK_ESCAPE) a->mode = UI_MODE_GAME;
+        return;
+    }
+    if (e->type != SDL_MOUSEBUTTONDOWN) return;
+    int x = e->button.x, y = e->button.y;
+    if (x >= WINDOW_WIDTH - 55 && x <= WINDOW_WIDTH && y >= 10 && y <= 55) {
+        a->mode = UI_MODE_GAME; return;
+    }
+    if (x >=  80 && x <= 300 && y >=  90 && y <= 155) {
+        if (c->state == STATE_STOPPED_BY_ARBITER) resume_by_arbiter(c);
+        else stop_by_arbiter(c);
+        return;
+    }
+    if (x >= 350 && x <= 570 && y >=  90 && y <= 155) { player_error(c, ACTIVE_LEFT);  return; }
+    if (x >= 620 && x <= 840 && y >=  90 && y <= 155) { player_error(c, ACTIVE_RIGHT); return; }
+    if (x >=  80 && x <= 300 && y >= 175 && y <= 240) { add_bonus_time(c, ACTIVE_LEFT,  2000); return; }
+    if (x >= 350 && x <= 570 && y >= 175 && y <= 240) { add_bonus_time(c, ACTIVE_RIGHT, 2000); return; }
+    if (x >= 620 && x <= 840 && y >= 175 && y <= 240) { a->mode = UI_MODE_GAME; return; }
+}
+
+static void handle_qr_events(AppResources* a, const SDL_Event* e, bool* running) {
+    if (e->type == SDL_QUIT) { *running = false; return; }
+    if (e->type == SDL_KEYDOWN && e->key.keysym.sym == SDLK_ESCAPE) {
+        *running = false; return;
+    }
+    if (e->type == SDL_MOUSEBUTTONDOWN) {
+        int x = e->button.x, y = e->button.y;
+        if (x >= WINDOW_WIDTH - 55 && x <= WINDOW_WIDTH && y >= 10 && y <= 55) {
+            *running = false;
+        }
+    }
+}
+
+static void ui_process_events(ClockState* c, AppResources* a, bool* running) {
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) {
+        switch (a->mode) {
+            case UI_MODE_QR:      handle_qr_events(a, &e, running);      break;
+            case UI_MODE_SETUP:   handle_setup_events(c, a, &e, running); break;
+            case UI_MODE_ARBITER: handle_arbiter_events(c, a, &e, running); break;
+            case UI_MODE_HELP:
+                if (e.type == SDL_QUIT) *running = false;
+                else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE)
+                    a->mode = UI_MODE_GAME;
+                else if (e.type == SDL_MOUSEBUTTONDOWN) {
+                    int x = e.button.x, y = e.button.y;
+                    if (x >= WINDOW_WIDTH - 55 && x <= WINDOW_WIDTH && y >= 10 && y <= 55)
+                        a->mode = UI_MODE_GAME;
+                }
+                break;
+            case UI_MODE_GAME:
+            default:              handle_game_events(c, a, &e, running); break;
+        }
+    }
+}
+
+static void ui_render_frame(SDL_Renderer* r, AppResources* a, const ClockState* c) {
+    switch (a->mode) {
+        case UI_MODE_QR:      draw_qr_screen(r, a);          break;
+        case UI_MODE_SETUP:   draw_setup_screen(r, a);       break;
+        case UI_MODE_HELP:    draw_help_screen(r, a);        break;
+        case UI_MODE_ARBITER: draw_arbiter_menu(r, a, c);    break;
+        case UI_MODE_GAME:
+        default:              draw_game_screen(r, a, c);     break;
+    }
+}
+
+// ─── HTTP relay (same behaviour as the old main.cpp) ────────────────────────
+
+static std::string stripPort(const std::string& ip) {
+    auto p = ip.find(':');
+    return (p == std::string::npos) ? ip : ip.substr(0, p);
+}
+
+static int portFromHost(const std::string& host, int fallback) {
+    auto p = host.find(':');
+    if (p == std::string::npos) return fallback;
+    try { return std::stoi(host.substr(p + 1)); } catch (...) { return fallback; }
+}
+
+static std::string httpPost(const std::string& ip, int port,
+                            const std::string& path, const std::string& body,
+                            const std::string& clockCode = "",
+                            const std::string& apiKey = "") {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return "";
+
+    struct timeval tv{5, 0};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);
+    inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+
+    if (connect(sock, (sockaddr*)&addr, sizeof(addr)) < 0) { close(sock); return ""; }
+
+    std::ostringstream req;
+    req << "POST " << path << " HTTP/1.1\r\n"
+        << "Host: " << ip << ":" << port << "\r\n"
+        << "Content-Type: application/json\r\n"
+        << "Content-Length: " << body.size() << "\r\n";
+    if (!clockCode.empty()) req << "X-Clock-Code: " << clockCode << "\r\n";
+    if (!apiKey.empty())    req << "X-API-Key: "    << apiKey    << "\r\n";
+    req << "Connection: close\r\n\r\n" << body;
+    std::string r = req.str();
+    send(sock, r.c_str(), r.size(), 0);
+
+    std::string response;
+    char buf[4096];
+    int n;
+    while ((n = recv(sock, buf, sizeof(buf) - 1, 0)) > 0) {
+        buf[n] = '\0';
+        response += buf;
+    }
+    close(sock);
+    return response;
+}
+
+static std::string parseGameId(const std::string& response) {
+    auto pos = response.find("\"game_id\"");
+    if (pos == std::string::npos) return "";
+    auto colon = response.find(':', pos);
+    if (colon == std::string::npos) return "";
+    size_t s = colon + 1;
+    while (s < response.size() && (response[s] == ' ' || response[s] == '\n' || response[s] == '\r')) s++;
+    if (s >= response.size()) return "";
+    if (response[s] == '"') {
+        auto q = response.find('"', s + 1);
+        if (q == std::string::npos) return "";
+        return response.substr(s + 1, q - s - 1);
+    }
+    size_t e = s;
+    while (e < response.size() && std::isdigit(static_cast<unsigned char>(response[e]))) e++;
+    return response.substr(s, e - s);
+}
+
+static std::string requestNewGame(const std::string& ip, int port,
+                                  const std::string& white, const std::string& black,
+                                  long long tcMs,
+                                  const std::string& clockCode = "",
+                                  const std::string& apiKey = "") {
+    std::ostringstream b;
+    b << "{\"white_player\":\"" << white << "\","
+      << "\"black_player\":\""  << black << "\","
+      << "\"time_control_ms\":" << tcMs << "}";
+    std::string resp = httpPost(ip, port, "/api/clock/newgame", b.str(), clockCode, apiKey);
+    return parseGameId(resp);
+}
+
+static void sendMove(const std::string& ip, int port, const std::string& gameId,
+                     const std::string& move, const std::string& color, long long timeLeftMs,
+                     const std::string& clockCode = "",
+                     const std::string& apiKey = "") {
+    std::ostringstream b;
+    b << "{\"game_id\":" << gameId << ","
+      << "\"uci\":\""    << move   << "\","
+      << "\"player\":\"" << color  << "\","
+      << "\"time_left_ms\":" << timeLeftMs << "}";
+    httpPost(ip, port, "/api/clock/move", b.str(), clockCode, apiKey);
+}
+
+static void sendStatus(const std::string& ip, int port, const std::string& gameId,
+                       const std::string& status, const std::string& winner,
+                       const std::string& clockCode = "",
+                       const std::string& apiKey = "") {
+    std::ostringstream b;
+    b << "{\"game_id\":" << gameId << ","
+      << "\"status\":\"" << status << "\","
+      << "\"winner\":\"" << winner << "\"}";
+    httpPost(ip, port, "/api/clock/status", b.str(), clockCode, apiKey);
+}
+
+// ─── Bluetooth RFCOMM server ────────────────────────────────────────────────
+//
+// Listens on the first available Bluetooth adapter and channel `btChannel`.
+// Incoming text is split on '\n' and queued for the main thread.  Outgoing
+// messages are written directly from whichever thread calls send_line().
+
+class BluetoothServer {
+public:
+    bool start(int channel);
+    void stop();
+
+    bool is_connected() const { return connected_.load(); }
+    bool pop_line(std::string& out);
+    void send_line(const std::string& line);
+
+    std::string mac()     const { return mac_; }
+    int         channel() const { return channel_; }
+
+private:
+    void acceptLoop();
+
+    std::atomic<bool> running_{false};
+    std::atomic<bool> connected_{false};
+    std::thread       thr_;
+    int               srv_sock_ = -1;
+    int               cli_sock_ = -1;
+    int               channel_  = DEFAULT_BT_CHAN;
+    std::string       mac_      = "(niedostepne)";
+
+    std::mutex               qmu_;
+    std::deque<std::string>  queue_;
+    std::string              recv_buffer_;
+
+    std::mutex write_mu_;
+};
+
+bool BluetoothServer::start(int channel) {
+    channel_ = channel;
+
+    int dev_id = hci_get_route(nullptr);
+    if (dev_id >= 0) {
+        bdaddr_t bdaddr{};
+        if (hci_devba(dev_id, &bdaddr) == 0) {
+            char addr[18] = {0};
+            ba2str(&bdaddr, addr);
+            mac_ = addr;
+        }
+    }
+
+    srv_sock_ = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
+    if (srv_sock_ < 0) {
+        std::perror("bluetooth socket()");
+        return false;
+    }
+
+    sockaddr_rc loc{};
+    loc.rc_family           = AF_BLUETOOTH;
+    bdaddr_t any_addr{{0,0,0,0,0,0}};
+    loc.rc_bdaddr           = any_addr;
+    loc.rc_channel          = static_cast<uint8_t>(channel);
+
+    if (bind(srv_sock_, (sockaddr*)&loc, sizeof(loc)) < 0) {
+        std::perror("bluetooth bind()");
+        close(srv_sock_); srv_sock_ = -1;
+        return false;
+    }
+    if (listen(srv_sock_, 1) < 0) {
+        std::perror("bluetooth listen()");
+        close(srv_sock_); srv_sock_ = -1;
+        return false;
+    }
+
+    running_ = true;
+    thr_ = std::thread(&BluetoothServer::acceptLoop, this);
+    return true;
+}
+
+void BluetoothServer::stop() {
+    running_ = false;
+    if (cli_sock_ >= 0) { ::shutdown(cli_sock_, SHUT_RDWR); close(cli_sock_); cli_sock_ = -1; }
+    if (srv_sock_ >= 0) { ::shutdown(srv_sock_, SHUT_RDWR); close(srv_sock_); srv_sock_ = -1; }
+    if (thr_.joinable()) thr_.join();
+}
+
+void BluetoothServer::acceptLoop() {
+    while (running_.load()) {
+        sockaddr_rc rem{};
+        socklen_t len = sizeof(rem);
+        int cs = accept(srv_sock_, (sockaddr*)&rem, &len);
+        if (cs < 0) {
+            if (!running_) return;
+            std::perror("bluetooth accept()");
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            continue;
+        }
+        cli_sock_ = cs;
+        connected_ = true;
+        {
+            std::lock_guard<std::mutex> g(qmu_);
+            queue_.push_back("__BT_CONNECTED__");
+        }
+
+        char buf[1024];
+        while (running_.load()) {
+            int n = recv(cs, buf, sizeof(buf) - 1, 0);
+            if (n <= 0) break;
+            buf[n] = '\0';
+            recv_buffer_.append(buf, n);
+            size_t pos;
+            while ((pos = recv_buffer_.find('\n')) != std::string::npos) {
+                std::string line = recv_buffer_.substr(0, pos);
+                recv_buffer_.erase(0, pos + 1);
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (!line.empty()) {
+                    std::lock_guard<std::mutex> g(qmu_);
+                    queue_.push_back(line);
+                }
+            }
+        }
+
+        close(cs);
+        cli_sock_ = -1;
+        connected_ = false;
+        recv_buffer_.clear();
+        {
+            std::lock_guard<std::mutex> g(qmu_);
+            queue_.push_back("__BT_DISCONNECTED__");
+        }
+    }
+}
+
+bool BluetoothServer::pop_line(std::string& out) {
+    std::lock_guard<std::mutex> g(qmu_);
+    if (queue_.empty()) return false;
+    out = std::move(queue_.front());
+    queue_.pop_front();
+    return true;
+}
+
+void BluetoothServer::send_line(const std::string& line) {
+    std::lock_guard<std::mutex> g(write_mu_);
+    if (cli_sock_ < 0) return;
+    std::string msg = line;
+    if (msg.empty() || msg.back() != '\n') msg.push_back('\n');
+    ssize_t off = 0;
+    while (off < (ssize_t)msg.size()) {
+        ssize_t n = send(cli_sock_, msg.data() + off, msg.size() - off, MSG_NOSIGNAL);
+        if (n <= 0) break;
+        off += n;
+    }
+}
+
+// ─── Bluetooth command handling ─────────────────────────────────────────────
+
+struct Session {
+    Board                   board{};
+    std::string             gameId;
+    std::list<std::string>  moveHistory;
+    std::string             whiteName = "White";
+    std::string             blackName = "Black";
+    bool                    networked = false;
+    std::string             serverIp;
+    int                     serverPort = 9090;
+    std::string             clockCode;
+    std::string             apiKey;
+    bool                    tcEnabled  = false;
+    long long               startMs    = 0;
+    bool                    over       = false;
+};
+
+static std::vector<std::string> splitPipe(const std::string& s) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s) {
+        if (c == '|') { out.push_back(cur); cur.clear(); }
+        else cur.push_back(c);
+    }
+    out.push_back(cur);
+    return out;
+}
+
+static std::string trim(std::string s) {
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.pop_back();
+    size_t i = 0;
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) i++;
+    return s.substr(i);
+}
+
+static std::string colorName(Color c) {
+    return (c == Color::WHITE) ? "White" : "Black";
+}
+
+static void startNewGame(Session& sess, AppResources& app, ClockState& cs,
+                         BluetoothServer& bt,
+                         const std::string& white, const std::string& black,
+                         int minutes, int incSec) {
+    sess.whiteName = white.empty() ? "White" : white;
+    sess.blackName = black.empty() ? "Black" : black;
+    sess.moveHistory.clear();
+    sess.board = Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    sess.over  = false;
+
+    if (minutes > 0) {
+        sess.tcEnabled = true;
+        sess.startMs   = (long long)minutes * 60 * 1000;
+    } else {
+        sess.tcEnabled = false;
+        sess.startMs   = 0;
+    }
+
+    app.setup_minutes   = std::max(1, minutes > 0 ? minutes : (int)START_MINUTES);
+    app.setup_increment = std::max(0, incSec);
+    uint32_t startClockMs = app.setup_minutes * 60 * 1000;
+    uint32_t incMs        = app.setup_increment * 1000;
+    init_clock(&cs, startClockMs, incMs);
+    cs.state = STATE_RUNNING;
+    app.mode = UI_MODE_GAME;
+
+    if (sess.networked) {
+        sess.gameId = requestNewGame(sess.serverIp, sess.serverPort,
+                                     sess.whiteName, sess.blackName,
+                                     sess.tcEnabled ? sess.startMs : 0,
+                                     sess.clockCode, sess.apiKey);
+        if (sess.gameId.empty()) {
+            bt.send_line("ERR|server_unreachable");
+        } else {
+            bt.send_line("OK|newgame|" + sess.gameId);
+        }
+    } else {
+        bt.send_line("OK|newgame|local");
+    }
+}
+
+static void tryMove(Session& sess, AppResources& app, ClockState& cs,
+                    BluetoothServer& bt, const std::string& uciStr) {
+    if (sess.over) { bt.send_line("ERR|game_over"); return; }
+
+    Movelist moves;
+    movegen::legalmoves(moves, sess.board);
+    if (moves.size() == 0) { bt.send_line("ERR|no_legal_moves"); return; }
+
+    bool isWhiteTurn = (sess.board.sideToMove() == Color::WHITE);
+
+    Move m;
+    try { m = uci::uciToMove(sess.board, uciStr); }
+    catch (...) { bt.send_line("ERR|bad_format|" + uciStr); return; }
+
+    bool legal = false;
+    for (auto mv : moves) if (uci::moveToUci(mv) == uciStr) { legal = true; break; }
+    if (!legal) { bt.send_line("ERR|illegal_move|" + uciStr); return; }
+
+    sess.board.makeMove(m);
+    sess.moveHistory.push_back(uciStr);
+
+    // Drive the clock exactly the way a physical press would.
+    ActiveSide side = isWhiteTurn ? ACTIVE_LEFT : ACTIVE_RIGHT;
+    if (cs.state != STATE_RUNNING) cs.state = STATE_RUNNING;
+    switch_side(&cs, side);
+
+    long long timeLeftMs = isWhiteTurn ? cs.left.remaining_ms : cs.right.remaining_ms;
+    std::string playerColor = isWhiteTurn ? "White" : "Black";
+    if (sess.networked && !sess.gameId.empty())
+        sendMove(sess.serverIp, sess.serverPort, sess.gameId, uciStr, playerColor,
+                 sess.tcEnabled ? timeLeftMs : 0,
+                 sess.clockCode, sess.apiKey);
+    bt.send_line("MOVE_ACCEPTED|" + uciStr);
+
+    // Detect end of game.
+    Movelist next;
+    movegen::legalmoves(next, sess.board);
+    if (next.size() == 0) {
+        std::string status, winner;
+        if (sess.board.inCheck()) {
+            status = "checkmate";
+            winner = (sess.board.sideToMove() == Color::WHITE) ? "Black" : "White";
+            cs.state = (winner == "White") ? STATE_FINISHED_LEFT_WIN : STATE_FINISHED_RIGHT_WIN;
+        } else {
+            status = "stalemate";
+            winner = "Draw";
+            cs.state = STATE_FINISHED_DRAW;
+        }
+        sess.over = true;
+        if (sess.networked && !sess.gameId.empty())
+            sendStatus(sess.serverIp, sess.serverPort, sess.gameId, status, winner,
+                       sess.clockCode, sess.apiKey);
+        bt.send_line("GAME_OVER|" + winner + "|" + status);
+    }
+}
+
+static void checkTimeout(Session& sess, ClockState& cs, BluetoothServer& bt) {
+    if (sess.over) return;
+    if (cs.state != STATE_FINISHED_LEFT_WIN && cs.state != STATE_FINISHED_RIGHT_WIN)
+        return;
+    std::string winner = (cs.state == STATE_FINISHED_LEFT_WIN) ? "White" : "Black";
+    sess.over = true;
+    if (sess.networked && !sess.gameId.empty())
+        sendStatus(sess.serverIp, sess.serverPort, sess.gameId, "timeout", winner,
+                   sess.clockCode, sess.apiKey);
+    bt.send_line("GAME_OVER|" + winner + "|timeout");
+}
+
+static void handleBluetoothCommand(const std::string& line,
+                                   Session& sess, AppResources& app,
+                                   ClockState& cs, BluetoothServer& bt) {
+    if (line == "__BT_CONNECTED__") {
+        app.bt_status = "Telefon polaczony. Oczekiwanie na NEWGAME...";
+        if (app.mode == UI_MODE_QR) app.mode = UI_MODE_SETUP;
+        bt.send_line("HELLO|chess_clock_pi");
+        return;
+    }
+    if (line == "__BT_DISCONNECTED__") {
+        app.bt_status = "Telefon rozlaczony. Czekam ponownie...";
+        return;
+    }
+
+    auto parts = splitPipe(line);
+    for (auto& p : parts) p = trim(p);
+    if (parts.empty() || parts[0].empty()) return;
+    const std::string& cmd = parts[0];
+
+    if (cmd == "HELLO")       { bt.send_line("OK|hello"); return; }
+    if (cmd == "PAUSE")       { pause_resume_clock(&cs); bt.send_line("OK|pause"); return; }
+    if (cmd == "RESUME")      { if (cs.state == STATE_PAUSED) cs.state = STATE_RUNNING; bt.send_line("OK|resume"); return; }
+    if (cmd == "RESET")       {
+        uint32_t s = app.setup_minutes * 60 * 1000;
+        uint32_t i = app.setup_increment * 1000;
+        reset_clock(&cs, s, i);
+        sess.over = false;
+        sess.moveHistory.clear();
+        sess.board = Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        bt.send_line("OK|reset");
+        return;
+    }
+    if (cmd == "ARBITER_STOP")   { stop_by_arbiter(&cs);   bt.send_line("OK|arbiter_stop");   return; }
+    if (cmd == "ARBITER_RESUME") { resume_by_arbiter(&cs); bt.send_line("OK|arbiter_resume"); return; }
+    if (cmd == "QUIT")           { bt.send_line("OK|quit"); return; }
+
+    if (cmd == "NEWGAME") {
+        std::string w = parts.size() > 1 ? parts[1] : "White";
+        std::string b = parts.size() > 2 ? parts[2] : "Black";
+        int mins = parts.size() > 3 ? std::atoi(parts[3].c_str()) : START_MINUTES;
+        int inc  = parts.size() > 4 ? std::atoi(parts[4].c_str()) : INCREMENT_SECONDS;
+        startNewGame(sess, app, cs, bt, w, b, mins, inc);
+        return;
+    }
+
+    if (cmd == "MOVE") {
+        if (parts.size() < 2) { bt.send_line("ERR|move_requires_uci"); return; }
+        tryMove(sess, app, cs, bt, parts[1]);
+        return;
+    }
+
+    if (cmd == "ERROR") {
+        if (parts.size() < 2) { bt.send_line("ERR|who?"); return; }
+        ActiveSide who = (parts[1] == "white" || parts[1] == "White") ? ACTIVE_LEFT : ACTIVE_RIGHT;
+        player_error(&cs, who);
+        bt.send_line("OK|error");
+        return;
+    }
+
+    if (cmd == "BONUS") {
+        if (parts.size() < 3) { bt.send_line("ERR|who?|ms?"); return; }
+        ActiveSide who = (parts[1] == "white" || parts[1] == "White") ? ACTIVE_LEFT : ACTIVE_RIGHT;
+        uint32_t ms = (uint32_t)std::atoi(parts[2].c_str());
+        add_bonus_time(&cs, who, ms);
+        bt.send_line("OK|bonus");
+        return;
+    }
+
+    bt.send_line("ERR|unknown_command|" + cmd);
+}
+
+// ─── Main ───────────────────────────────────────────────────────────────────
+
+struct AppConfig {
+    std::string serverHost;
+    std::string serverIp;
+    int         serverPort = 9090;
+    int         btChannel  = DEFAULT_BT_CHAN;
+    bool        networked  = false;
+    std::string clockCode;
+    std::string apiKey;
+};
+
+// ─── Parser JSON dla clock.json ────────────────────────────────────────────────
+// Minimalny ekstraktor JSON — obsługuje tylko wartości tekstowe i całkowite.
+
+// Wyodrębnia wartość tekstową JSON dla danego klucza
+static std::string jsonString(const std::string& j, const std::string& key) {
+    auto kpos = j.find("\"" + key + "\"");
+    if (kpos == std::string::npos) return "";
+    auto colon = j.find(':', kpos);
+    if (colon == std::string::npos) return "";
+    auto q1 = j.find('"', colon + 1);
+    if (q1 == std::string::npos) return "";
+    auto q2 = j.find('"', q1 + 1);
+    if (q2 == std::string::npos) return "";
+    return j.substr(q1 + 1, q2 - q1 - 1);
+}
+
+// Wyodrębnia wartość liczby całkowitej JSON dla danego klucza
+static int jsonInt(const std::string& j, const std::string& key, int fallback) {
+    auto kpos = j.find("\"" + key + "\"");
+    if (kpos == std::string::npos) return fallback;
+    auto colon = j.find(':', kpos);
+    if (colon == std::string::npos) return fallback;
+    size_t s = colon + 1;
+    while (s < j.size() && (j[s] == ' ' || j[s] == '\t' || j[s] == '\n' || j[s] == '\r')) s++;
+    if (s >= j.size() || !std::isdigit((unsigned char)j[s])) return fallback;
+    try { return std::stoi(j.substr(s)); } catch (...) { return fallback; }
+}
+
+// Wczytuje clock.json (lub inną ścieżkę) i uzupełnia domyślne pola AppConfig
+// Argumenty wiersza poleceń zawsze mają wyższy priorytet niż wartości z JSON
+static void loadJsonConfig(AppConfig& c, const std::string& path = "clock.json") {
+    std::ifstream f(path);
+    if (!f.good()) return;
+    std::string json((std::istreambuf_iterator<char>(f)),
+                      std::istreambuf_iterator<char>());
+
+    // Wczytaj adres serwera (jeśli nie podany przez CLI)
+    if (c.serverHost.empty()) {
+        auto sv = jsonString(json, "server");
+        if (!sv.empty()) {
+            c.serverHost = sv;
+            c.serverIp   = stripPort(sv);
+            c.serverPort = portFromHost(sv, 9090);
+            c.networked  = true;
+        }
+    }
+    // Wczytaj kod zegara (ignoruj placeholder XXXX)
+    if (c.clockCode.empty()) {
+        auto cc = jsonString(json, "clock_code");
+        if (!cc.empty() && cc.find("XXXX") == std::string::npos) c.clockCode = cc;
+    }
+    // Wczytaj klucz API prywatny (ignoruj placeholder sk_...)
+    if (c.apiKey.empty()) {
+        auto pk = jsonString(json, "private_key");
+        if (!pk.empty() && pk != "sk_...") c.apiKey = pk;
+    }
+    // Wczytaj kanał Bluetooth (jeśli nie domyślny)
+    if (c.btChannel == DEFAULT_BT_CHAN) {
+        int bt = jsonInt(json, "bt_channel", 0);
+        if (bt > 0) c.btChannel = bt;
+    }
+}
+
+static AppConfig readConfig(int argc, char** argv) {
+    AppConfig c;
+
+    // 1. Wczytaj wartości domyślne z clock.json (ignoruj jeśli plik/pole brakuje)
+    loadJsonConfig(c);
+
+    // 2. Argumenty CLI nadpisują wartości z JSON
+    if (argc >= 2) {
+        c.serverHost = argv[1];
+        c.serverIp   = stripPort(c.serverHost);
+        c.serverPort = portFromHost(c.serverHost, 9090);
+        c.networked  = !c.serverIp.empty();
+    }
+    if (argc >= 3) c.btChannel  = std::atoi(argv[2]);
+    if (argc >= 4) c.clockCode  = argv[3];
+    if (argc >= 5) c.apiKey     = argv[4];
+    if (c.btChannel <= 0) c.btChannel = DEFAULT_BT_CHAN;
+    return c;
+}
+
+int main(int argc, char** argv) {
+    AppConfig cfg = readConfig(argc, argv);
+
+    AppResources app;
+    if (!ui_init(&app)) return 1;
+    app.bt_channel = cfg.btChannel;
+    if (!cfg.serverHost.empty()) app.server_info = cfg.serverHost;
+
+    BluetoothServer bt;
+    bool bt_ok = bt.start(cfg.btChannel);
+    if (bt_ok) app.bt_mac = bt.mac();
+    else       app.bt_status = "Blad: nie mozna uruchomic serwera Bluetooth (uruchom jako root?)";
+
+    std::ostringstream payload;
+    payload << "chessclock://" << app.bt_mac << "/" << app.bt_channel;
+    if (cfg.networked) payload << "?server=" << cfg.serverHost;
+    app.qr_payload = payload.str();
+    app.qr_texture = make_qr_texture(app.renderer, app.qr_payload, 6, &app.qr_w, &app.qr_h);
+
+    ClockState cs;
+    init_clock(&cs, START_MINUTES * 60 * 1000, INCREMENT_SECONDS * 1000);
+
+    Session sess;
+    sess.networked  = cfg.networked;
+    sess.serverIp   = cfg.serverIp;
+    sess.serverPort = cfg.serverPort;
+    sess.clockCode  = cfg.clockCode;
+    sess.apiKey     = cfg.apiKey;
+
+    bool app_running = true;
+    uint32_t prev_tick = SDL_GetTicks();
+    uint32_t last_clock_push = 0;
+
+    while (app_running) {
+        ui_process_events(&cs, &app, &app_running);
+
+        std::string line;
+        while (bt.pop_line(line)) {
+            handleBluetoothCommand(line, sess, app, cs, bt);
+        }
+
+        uint32_t now   = SDL_GetTicks();
+        uint32_t delta = now - prev_tick;
+        prev_tick      = now;
+        update_clock(&cs, delta);
+        checkTimeout(sess, cs, bt);
+
+        if (bt.is_connected() && now - last_clock_push > 500) {
+            last_clock_push = now;
+            std::ostringstream os;
+            os << "CLOCK|" << cs.left.remaining_ms << "|" << cs.right.remaining_ms
+               << "|" << (cs.active == ACTIVE_LEFT ? "white" : "black")
+               << "|" << (int)cs.state;
+            bt.send_line(os.str());
+        }
+
+        ui_render_frame(app.renderer, &app, &cs);
+        SDL_Delay(1000 / FPS);
+    }
+
+    bt.stop();
+    ui_cleanup(&app);
+    return 0;
+}
