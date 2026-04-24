@@ -1,0 +1,1184 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Szachy · Panel Arbitra &amp; Diagnostyka</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:      #1c1c1e;
+  --sb:      #141416;
+  --card:    #242428;
+  --panel:   #1a1a1e;
+  --hover:   #2c2c30;
+  --surface: #2a2a2e;
+  --bd:  #38383c;
+  --bd2: #48484c;
+  --bd3: #5a5a60;
+  --primary:      #3092e7;
+  --primary-soft: rgba(48,146,231,.13);
+  --primary-glow: rgba(48,146,231,.35);
+  --primary-d:    #1a70c4;
+  --gold:      #e5c158;
+  --gold-soft: rgba(229,193,88,.11);
+  --gold-d:    #a68631;
+  --green:      #4caf7d;
+  --green-soft: rgba(76,175,125,.12);
+  --green-d:    #2d7a56;
+  --red:      #e05252;
+  --red-soft: rgba(224,82,82,.12);
+  --red-d:    #a03030;
+  --orange:      #cd7b00;
+  --orange-soft: rgba(205,123,0,.12);
+  --t1: #f2f2f4;
+  --t2: #b4b4bc;
+  --t3: #7a7a84;
+  --t4: #52525a;
+  --r: 10px;
+}
+
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+html,body{height:100%;}
+body{
+  font-family:'Inter',system-ui,sans-serif;
+  background:var(--bg);color:var(--t1);min-height:100vh;
+  display:flex;
+}
+
+::-webkit-scrollbar{width:4px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:4px;}
+
+/* ── SIDEBAR */
+#sidebar{
+  width:220px;min-width:220px;background:var(--sb);
+  border-right:1px solid var(--bd);display:flex;flex-direction:column;
+  position:sticky;top:0;height:100vh;
+}
+.sb-brand{
+  padding:18px 16px 16px;border-bottom:1px solid var(--bd);
+  display:flex;align-items:center;gap:10px;
+}
+.sb-brand-icon{
+  width:34px;height:34px;border-radius:9px;
+  background:linear-gradient(140deg,var(--orange),var(--gold-d));
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+  color:#fff;
+}
+.sb-brand-icon svg{width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:1.9;stroke-linecap:round;}
+.sb-brand-text{font-family:'Space Grotesk',sans-serif;font-size:.97rem;font-weight:700;color:var(--t1);line-height:1.15;}
+.sb-brand-text small{display:block;font-size:.58rem;font-weight:400;color:var(--t3);letter-spacing:.07em;text-transform:uppercase;}
+
+.sb-nav{flex:1;padding:10px 8px;overflow-y:auto;}
+.sb-nav a{
+  display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:7px;
+  color:var(--t3);text-decoration:none;font-size:.81rem;font-weight:500;
+  transition:all .12s;cursor:pointer;border:1px solid transparent;margin-bottom:1px;
+}
+.sb-nav a:hover{background:var(--hover);color:var(--t1);}
+.sb-nav a.act{background:var(--primary-soft);color:var(--primary);border-color:rgba(48,146,231,.18);}
+.sb-nav .ni{width:16px;height:16px;flex-shrink:0;display:flex;align-items:center;justify-content:center;}
+.sb-nav .ni svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.7;}
+.sb-sep{height:1px;background:var(--bd);margin:8px 10px;}
+.sb-lbl{padding:6px 10px 3px;font-size:.59rem;letter-spacing:.1em;text-transform:uppercase;color:var(--t4);}
+
+/* ── CONTENT */
+#content{flex:1;overflow-y:auto;padding:28px 30px;}
+.page{display:none;}
+.page.show{display:block;}
+
+.page-header{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:22px;}
+.page-title{font-family:'Space Grotesk',sans-serif;font-size:1.4rem;font-weight:700;color:var(--t1);letter-spacing:-.015em;}
+.page-sub{font-size:.78rem;color:var(--t3);margin-top:3px;}
+
+/* ── CARDS */
+.card{background:var(--card);border:1px solid var(--bd2);border-radius:14px;padding:20px 22px;margin-bottom:16px;}
+.card-title{font-family:'Space Grotesk',sans-serif;font-size:.88rem;font-weight:600;color:var(--t1);margin-bottom:14px;display:flex;align-items:center;gap:8px;}
+.card-title svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.8;}
+
+/* ── FORM */
+.form-row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px;}
+.fg{display:flex;flex-direction:column;gap:5px;flex:1;min-width:120px;}
+label{font-size:.71rem;color:var(--t3);font-weight:500;letter-spacing:.03em;}
+input,select{
+  background:var(--panel);border:1px solid var(--bd2);border-radius:7px;
+  color:var(--t1);font-size:.82rem;font-family:'Inter',sans-serif;
+  padding:8px 11px;outline:none;transition:border-color .15s;width:100%;
+}
+input:focus,select:focus{border-color:var(--primary-d);box-shadow:0 0 0 2px rgba(48,146,231,.15);}
+input::placeholder{color:var(--t4);}
+
+/* ── BUTTONS */
+.btn{
+  display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:8px;
+  cursor:pointer;font-size:.79rem;font-weight:500;border:1px solid;
+  transition:all .13s;font-family:'Inter',sans-serif;white-space:nowrap;flex-shrink:0;
+}
+.btn svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:1.9;}
+.btn-primary{background:var(--primary-soft);border-color:var(--primary-d);color:var(--primary);}
+.btn-primary:hover{background:rgba(48,146,231,.22);border-color:var(--primary);}
+.btn-primary:disabled{opacity:.4;cursor:not-allowed;}
+.btn-danger{background:var(--red-soft);border-color:var(--red-d);color:var(--red);}
+.btn-danger:hover{background:rgba(224,82,82,.2);border-color:var(--red);}
+.btn-ghost{background:transparent;border-color:var(--bd2);color:var(--t2);}
+.btn-ghost:hover{background:var(--card);border-color:var(--bd3);color:var(--t1);}
+.btn-green{background:var(--green-soft);border-color:var(--green-d);color:var(--green);}
+.btn-green:hover{background:rgba(76,175,125,.22);border-color:var(--green);}
+.btn-gold{background:var(--gold-soft);border-color:var(--gold-d);color:var(--gold);}
+.btn-gold:hover{background:rgba(229,193,88,.2);border-color:var(--gold);}
+
+/* ── STATUS OUTPUT */
+.out{
+  margin-top:12px;padding:12px 14px;border-radius:8px;font-size:.78rem;
+  font-family:'JetBrains Mono',monospace;line-height:1.6;
+  background:var(--panel);border:1px solid var(--bd);color:var(--t2);
+  min-height:38px;white-space:pre-wrap;word-break:break-all;
+  max-height:220px;overflow-y:auto;
+}
+.out.ok  {border-color:var(--green-d);color:var(--green);}
+.out.err {border-color:var(--red-d);color:var(--red);}
+.out.info{border-color:var(--primary-d);color:var(--primary);}
+
+/* ── TEST RUNNER */
+.test-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin-bottom:16px;}
+.test-item{
+  background:var(--card);border:1px solid var(--bd2);border-radius:10px;
+  padding:14px 16px;display:flex;align-items:center;gap:12px;
+  transition:border-color .2s;
+}
+.test-item.pass{border-color:var(--green-d);background:rgba(76,175,125,.05);}
+.test-item.fail{border-color:var(--red-d);background:rgba(224,82,82,.05);}
+.test-item.run {border-color:var(--primary-d);background:var(--primary-soft);}
+.test-item.skip{border-color:var(--bd2);opacity:.5;}
+
+.test-dot{
+  width:10px;height:10px;border-radius:50%;background:var(--bd3);flex-shrink:0;
+  transition:background .2s;
+}
+.test-item.pass .test-dot{background:var(--green);}
+.test-item.fail .test-dot{background:var(--red);}
+.test-item.run  .test-dot{background:var(--primary);animation:pulse .9s ease-in-out infinite;}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+.test-name{font-size:.79rem;font-weight:500;color:var(--t1);flex:1;}
+.test-time{font-family:'JetBrains Mono',monospace;font-size:.67rem;color:var(--t3);}
+
+.summary-bar{
+  display:flex;align-items:center;gap:16px;padding:12px 16px;
+  background:var(--card);border:1px solid var(--bd2);border-radius:10px;margin-bottom:16px;
+  font-size:.79rem;
+}
+.sum-val{font-family:'JetBrains Mono',monospace;font-size:1.1rem;font-weight:700;}
+.sum-label{color:var(--t3);font-size:.68rem;text-transform:uppercase;letter-spacing:.07em;}
+.sum-pass{color:var(--green);}
+.sum-fail{color:var(--red);}
+.sum-skip{color:var(--t3);}
+.sum-div{width:1px;height:32px;background:var(--bd2);}
+
+/* ── PING TABLE */
+.ping-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px;}
+.ping-row{
+  display:flex;align-items:center;gap:10px;padding:10px 14px;
+  background:var(--card);border:1px solid var(--bd2);border-radius:9px;
+  transition:border-color .15s;
+}
+.ping-city{font-size:.82rem;font-weight:500;color:var(--t1);flex:1;}
+.ping-val{font-family:'JetBrains Mono',monospace;font-size:.79rem;font-weight:600;min-width:60px;text-align:right;}
+.ping-bar{height:4px;border-radius:2px;background:var(--bd2);overflow:hidden;margin-top:4px;}
+.ping-fill{height:100%;border-radius:2px;transition:width .6s ease;}
+.ping-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;background:var(--bd3);}
+
+.ping-good .ping-val{color:var(--green);}
+.ping-good .ping-dot{background:var(--green);}
+.ping-good .ping-fill{background:var(--green);}
+.ping-mid  .ping-val{color:var(--gold);}
+.ping-mid  .ping-dot{background:var(--gold);}
+.ping-mid  .ping-fill{background:var(--gold);}
+.ping-bad  .ping-val{color:var(--red);}
+.ping-bad  .ping-dot{background:var(--red);}
+.ping-bad  .ping-fill{background:var(--red);}
+.ping-wait .ping-val{color:var(--t4);}
+.ping-wait .ping-dot{background:var(--t4);animation:pulse .9s ease-in-out infinite;}
+
+/* ── ARBITER */
+.arbiter-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+.section-sep{height:1px;background:var(--bd);margin:18px 0;}
+.section-label{font-size:.65rem;color:var(--t3);text-transform:uppercase;letter-spacing:.1em;font-weight:600;margin-bottom:10px;}
+
+.pill{display:inline-block;font-size:.56rem;font-family:'JetBrains Mono',monospace;padding:2px 7px;border-radius:4px;text-transform:uppercase;letter-spacing:.05em;border:1px solid;font-weight:500;}
+.pill.ongoing  {color:var(--green);border-color:rgba(76,175,125,.3); background:var(--green-soft);}
+.pill.checkmate{color:var(--red);  border-color:rgba(224,82,82,.3); background:var(--red-soft);}
+.pill.stalemate{color:var(--gold); border-color:rgba(229,193,88,.3);background:var(--gold-soft);}
+.pill.timeout  {color:var(--t2);   border-color:var(--bd3);background:var(--hover);}
+
+/* game list */
+.glist{display:flex;flex-direction:column;gap:6px;max-height:320px;overflow-y:auto;}
+.gitem{
+  display:flex;align-items:center;gap:10px;padding:10px 12px;
+  background:var(--panel);border:1px solid var(--bd);border-radius:8px;cursor:pointer;
+  transition:border-color .13s;
+}
+.gitem:hover{border-color:var(--bd3);}
+.gitem.sel{border-color:var(--primary-d);background:var(--primary-soft);}
+.gi-id{font-family:'JetBrains Mono',monospace;font-size:.67rem;color:var(--t3);min-width:28px;}
+.gi-players{font-size:.8rem;font-weight:500;flex:1;}
+.gi-status{}
+
+/* speed test */
+.speed-bars{display:flex;flex-direction:column;gap:8px;margin-top:12px;}
+.speed-row{display:flex;align-items:center;gap:10px;}
+.speed-label{font-size:.74rem;color:var(--t2);min-width:180px;}
+.speed-track{flex:1;height:6px;background:var(--bd2);border-radius:3px;overflow:hidden;}
+.speed-fill{height:100%;border-radius:3px;background:var(--primary);transition:width .5s ease;}
+.speed-val{font-family:'JetBrains Mono',monospace;font-size:.72rem;color:var(--t2);min-width:60px;text-align:right;}
+
+/* log */
+.log{
+  background:var(--panel);border:1px solid var(--bd);border-radius:8px;
+  font-family:'JetBrains Mono',monospace;font-size:.72rem;line-height:1.65;
+  padding:12px 14px;max-height:260px;overflow-y:auto;color:var(--t2);
+}
+.log .lg-ok  {color:var(--green);}
+.log .lg-err {color:var(--red);}
+.log .lg-info{color:var(--primary);}
+.log .lg-dim {color:var(--t4);}
+</style>
+</head>
+<body>
+
+<div id="sidebar">
+  <div class="sb-brand">
+    <div class="sb-brand-icon">
+      <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+    </div>
+    <div class="sb-brand-text">
+      Diagnostyka
+      <small>panel arbitra</small>
+    </div>
+  </div>
+  <nav class="sb-nav">
+    <div class="sb-lbl">Arbiter</div>
+    <a class="act" onclick="showPage('arbiter')" id="nav-arbiter">
+      <span class="ni"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 3v18"/></svg></span>
+      Panel arbitra
+    </a>
+
+    <div class="sb-sep"></div>
+    <div class="sb-lbl">Testy</div>
+    <a onclick="showPage('tests')" id="nav-tests">
+      <span class="ni"><svg viewBox="0 0 24 24"><path d="M9 12l2 2 4-4M7.835 4.697a3.42 3.42 0 0 0 1.946-.806 3.42 3.42 0 0 1 4.438 0 3.42 3.42 0 0 0 1.946.806 3.42 3.42 0 0 1 3.138 3.138 3.42 3.42 0 0 0 .806 1.946 3.42 3.42 0 0 1 0 4.438 3.42 3.42 0 0 0-.806 1.946 3.42 3.42 0 0 1-3.138 3.138 3.42 3.42 0 0 0-1.946.806 3.42 3.42 0 0 1-4.438 0 3.42 3.42 0 0 0-1.946-.806 3.42 3.42 0 0 1-3.138-3.138 3.42 3.42 0 0 0-.806-1.946 3.42 3.42 0 0 1 0-4.438 3.42 3.42 0 0 0 .806-1.946 3.42 3.42 0 0 1 3.138-3.138z"/></svg></span>
+      Testy usług
+    </a>
+    <a onclick="showPage('speed')" id="nav-speed">
+      <span class="ni"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></span>
+      Test wydajnosci
+    </a>
+
+    <div class="sb-sep"></div>
+    <div class="sb-lbl">Siec</div>
+    <a onclick="showPage('ping')" id="nav-ping">
+      <span class="ni"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49M7.76 7.76a6 6 0 0 0 0 8.49M20.49 3.51a12 12 0 0 1 0 16.97M3.51 3.51a12 12 0 0 0 0 16.97"/></svg></span>
+      Ping miast
+    </a>
+
+    <div class="sb-sep"></div>
+    <a href="/" style="color:var(--t3);text-decoration:none;" onclick="void 0">
+      <span class="ni"><svg viewBox="0 0 24 24"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg></span>
+      Widok partii
+    </a>
+    <a href="/admin" style="color:var(--t3);text-decoration:none;" onclick="void 0">
+      <span class="ni"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></span>
+      Panel admina
+    </a>
+  </nav>
+</div>
+
+<div id="content">
+
+<!-- ═══ ARBITER ═══════════════════════════════════════════════════════════════ -->
+<div class="page show" id="page-arbiter">
+  <div class="page-header">
+    <div>
+      <div class="page-title">Panel arbitra</div>
+      <div class="page-sub">Zarzadzanie partiami — tworzenie, ruchy, wyniki</div>
+    </div>
+    <button class="btn btn-ghost" onclick="arbLoadGames()">
+      <svg viewBox="0 0 24 24"><path d="M1 4v6h6M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4-4.64 4.36A9 9 0 0 1 3.51 15"/></svg>
+      Odswierz
+    </button>
+  </div>
+
+  <div class="arbiter-grid">
+    <!-- LEWA: nowa gra + akcje -->
+    <div>
+      <div class="card">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+          Nowa partia
+        </div>
+        <div class="form-row">
+          <div class="fg">
+            <label>Biali</label>
+            <input id="arb-white" placeholder="np. Magnus Carlsen">
+          </div>
+          <div class="fg">
+            <label>Czarni</label>
+            <input id="arb-black" placeholder="np. Hikaru Nakamura">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="fg">
+            <label>Czas kontrolny (sekundy, 0 = brak)</label>
+            <input id="arb-tc" type="number" value="300" min="0">
+          </div>
+          <button class="btn btn-green" onclick="arbNewGame()">
+            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+            Utworz
+          </button>
+        </div>
+        <div class="out" id="out-newgame">&#8212;</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+          Zapis ruchu
+        </div>
+        <div class="form-row">
+          <div class="fg" style="max-width:90px">
+            <label>ID gry</label>
+            <input id="arb-move-gid" type="number" placeholder="1">
+          </div>
+          <div class="fg" style="max-width:100px">
+            <label>Ruch (UCI)</label>
+            <input id="arb-move-uci" placeholder="e2e4">
+          </div>
+          <div class="fg" style="max-width:100px">
+            <label>Gracz</label>
+            <select id="arb-move-player">
+              <option value="White">Biali</option>
+              <option value="Black">Czarni</option>
+            </select>
+          </div>
+          <div class="fg" style="max-width:100px">
+            <label>Czas pozostaly (ms)</label>
+            <input id="arb-move-time" type="number" placeholder="0">
+          </div>
+          <button class="btn btn-primary" onclick="arbMove()">Wyslij</button>
+        </div>
+        <div class="out" id="out-move">&#8212;</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/></svg>
+          Wynik partii
+        </div>
+        <div class="form-row">
+          <div class="fg" style="max-width:90px">
+            <label>ID gry</label>
+            <input id="arb-status-gid" type="number" placeholder="1">
+          </div>
+          <div class="fg">
+            <label>Status</label>
+            <select id="arb-status-type">
+              <option value="checkmate">Mat (checkmate)</option>
+              <option value="stalemate">Pat (stalemate)</option>
+              <option value="timeout">Przekroczenie czasu</option>
+              <option value="draw">Remis (draw)</option>
+              <option value="resignation">Poddanie (resignation)</option>
+            </select>
+          </div>
+          <div class="fg">
+            <label>Zwyciezca</label>
+            <select id="arb-winner">
+              <option value="">Brak / Remis</option>
+              <option value="White">Biali</option>
+              <option value="Black">Czarni</option>
+            </select>
+          </div>
+          <button class="btn btn-gold" onclick="arbStatus()">Zapisz</button>
+        </div>
+        <div class="out" id="out-status">&#8212;</div>
+      </div>
+    </div>
+
+    <!-- PRAWA: lista gier -->
+    <div>
+      <div class="card" style="height:calc(100% - 0px)">
+        <div class="card-title" style="margin-bottom:10px">
+          <svg viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+          Aktywne partie
+          <span style="margin-left:auto;font-family:'JetBrains Mono',monospace;font-size:.67rem;color:var(--t3)" id="arb-gcount">&#8212;</span>
+        </div>
+        <div class="glist" id="arb-glist">
+          <div style="padding:24px;text-align:center;color:var(--t3);font-size:.8rem">Ladowanie...</div>
+        </div>
+        <div class="section-sep" style="margin:14px 0 12px"></div>
+        <div class="card-title" style="margin-bottom:10px">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9 10h0M15 10h0M9.5 15a3.5 3.5 0 0 0 5 0"/></svg>
+          Szczegoly wybranej gry
+        </div>
+        <div class="out" id="out-gamedetail" style="max-height:180px">Wybierz partie z listy</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ TESTY USŁUG ══════════════════════════════════════════════════════════ -->
+<div class="page" id="page-tests">
+  <div class="page-header">
+    <div>
+      <div class="page-title">Testy usług</div>
+      <div class="page-sub">Automatyczne sprawdzenie wszystkich endpointów API</div>
+    </div>
+    <button class="btn btn-primary" id="btn-run-tests" onclick="runAllTests()">
+      <svg viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+      Uruchom wszystkie
+    </button>
+  </div>
+
+  <div class="summary-bar" id="test-summary" style="display:none">
+    <div>
+      <div class="sum-val sum-pass" id="sum-pass">0</div>
+      <div class="sum-label">Przeszly</div>
+    </div>
+    <div class="sum-div"></div>
+    <div>
+      <div class="sum-val sum-fail" id="sum-fail">0</div>
+      <div class="sum-label">Nie przeszly</div>
+    </div>
+    <div class="sum-div"></div>
+    <div>
+      <div class="sum-val" id="sum-total" style="color:var(--t2)">0</div>
+      <div class="sum-label">Lacznie</div>
+    </div>
+    <div class="sum-div"></div>
+    <div>
+      <div class="sum-val" id="sum-dur" style="color:var(--t2)">&#8212;</div>
+      <div class="sum-label">Czas</div>
+    </div>
+  </div>
+
+  <div class="test-grid" id="test-grid"></div>
+
+  <div class="card">
+    <div class="card-title">
+      <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+      Log testow
+    </div>
+    <div class="log" id="test-log">Nacisnij "Uruchom wszystkie" aby rozpoczac...</div>
+  </div>
+</div>
+
+<!-- ═══ TEST WYDAJNOŚCI ══════════════════════════════════════════════════════ -->
+<div class="page" id="page-speed">
+  <div class="page-header">
+    <div>
+      <div class="page-title">Test wydajnosci</div>
+      <div class="page-sub">Pomiar czasu odpowiedzi wszystkich endpointow serwera</div>
+    </div>
+    <button class="btn btn-primary" id="btn-speed" onclick="runSpeedTest()">
+      <svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+      Uruchom benchmark
+    </button>
+  </div>
+
+  <div class="card">
+    <div class="card-title">
+      <svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+      Czas odpowiedzi endpointow (ms)
+    </div>
+    <div class="speed-bars" id="speed-bars">
+      <div style="color:var(--t3);font-size:.8rem;padding:8px 0">Kliknij "Uruchom benchmark" aby zmierzyc...</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:0">
+    <div class="card-title">
+      <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+      Szczegoly
+    </div>
+    <div class="log" id="speed-log">Oczekiwanie na wyniki...</div>
+  </div>
+</div>
+
+<!-- ═══ PING MIAST ═══════════════════════════════════════════════════════════ -->
+<div class="page" id="page-ping">
+  <div class="page-header">
+    <div>
+      <div class="page-title">Ping miast Polski</div>
+      <div class="page-sub">Pomiar czasu dostepu HTTP do 30 najwiekszych miast w Polsce (przez publiczne punkty)</div>
+    </div>
+    <button class="btn btn-primary" id="btn-ping" onclick="runPingTest()">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49M7.76 7.76a6 6 0 0 0 0 8.49"/></svg>
+      Uruchom ping
+    </button>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <div class="card-title">
+      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+      Legenda
+    </div>
+    <div style="display:flex;gap:18px;font-size:.75rem;color:var(--t3)">
+      <span style="color:var(--green)">&#9679; &lt;100 ms — szybki</span>
+      <span style="color:var(--gold)">&#9679; 100–300 ms — sredni</span>
+      <span style="color:var(--red)">&#9679; &gt;300 ms lub blad — wolny/niedostepny</span>
+    </div>
+  </div>
+
+  <div class="ping-grid" id="ping-grid"></div>
+</div>
+
+</div><!-- /content -->
+
+<script>
+/* ──────────────────────────────────────────────────────────────────────────
+   UTILS
+──────────────────────────────────────────────────────────────────────────── */
+function showPage(name) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('show'));
+  document.querySelectorAll('.sb-nav a').forEach(a => a.classList.remove('act'));
+  document.getElementById('page-' + name)?.classList.add('show');
+  document.getElementById('nav-' + name)?.classList.add('act');
+  if (name === 'arbiter') arbLoadGames();
+  if (name === 'ping')    initPingGrid();
+  if (name === 'tests')   initTestGrid();
+}
+
+function setOut(id, text, cls) {
+  var el = document.getElementById(id);
+  el.textContent = text;
+  el.className = 'out' + (cls ? ' ' + cls : '');
+}
+
+async function apiFetch(path, opts) {
+  var t0 = performance.now();
+  try {
+    var r = await fetch(path, opts);
+    var ms = Math.round(performance.now() - t0);
+    var ct = r.headers.get('content-type') || '';
+    var body = ct.includes('json') ? await r.json() : await r.text();
+    return { ok: r.ok, status: r.status, body, ms };
+  } catch (e) {
+    var ms = Math.round(performance.now() - t0);
+    return { ok: false, status: 0, body: String(e), ms };
+  }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   ARBITER
+──────────────────────────────────────────────────────────────────────────── */
+var arbSelId = null;
+
+async function arbNewGame() {
+  var white = document.getElementById('arb-white').value.trim() || 'Biali';
+  var black = document.getElementById('arb-black').value.trim() || 'Czarni';
+  var tc    = parseInt(document.getElementById('arb-tc').value) || 0;
+  setOut('out-newgame', 'Tworzenie...', 'info');
+  var r = await apiFetch('/newgame', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ white_player: white, black_player: black, time_control_ms: tc * 1000 })
+  });
+  if (r.ok) {
+    setOut('out-newgame', 'Utworzono game_id=' + (r.body.game_id ?? '?') + '  (' + r.ms + ' ms)', 'ok');
+    document.getElementById('arb-move-gid').value   = r.body.game_id ?? '';
+    document.getElementById('arb-status-gid').value = r.body.game_id ?? '';
+    arbLoadGames();
+  } else {
+    setOut('out-newgame', 'Blad ' + r.status + ': ' + JSON.stringify(r.body), 'err');
+  }
+}
+
+async function arbMove() {
+  var gid    = document.getElementById('arb-move-gid').value;
+  var uci    = document.getElementById('arb-move-uci').value.trim();
+  var player = document.getElementById('arb-move-player').value;
+  var tms    = parseInt(document.getElementById('arb-move-time').value) || 0;
+  if (!gid || !uci) { setOut('out-move', 'Uzupelnij ID gry i ruch UCI', 'err'); return; }
+  setOut('out-move', 'Wysylanie...', 'info');
+  var payload = { game_id: parseInt(gid), move: uci, player };
+  if (tms > 0) payload.time_left_ms = tms;
+  var r = await apiFetch('/move', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
+  if (r.ok) {
+    setOut('out-move', 'Ruch #' + (r.body.move_number ?? '?') + ' zapisany  (' + r.ms + ' ms)', 'ok');
+    arbLoadGames();
+  } else {
+    setOut('out-move', 'Blad ' + r.status + ': ' + JSON.stringify(r.body), 'err');
+  }
+}
+
+async function arbStatus() {
+  var gid    = document.getElementById('arb-status-gid').value;
+  var status = document.getElementById('arb-status-type').value;
+  var winner = document.getElementById('arb-winner').value;
+  if (!gid) { setOut('out-status', 'Uzupelnij ID gry', 'err'); return; }
+  setOut('out-status', 'Zapisywanie...', 'info');
+  var r = await apiFetch('/status', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ game_id: parseInt(gid), status, winner })
+  });
+  if (r.ok) {
+    setOut('out-status', 'Status zapisany: ' + status + (winner ? ' — zwyciezca: ' + winner : '') + '  (' + r.ms + ' ms)', 'ok');
+    arbLoadGames();
+  } else {
+    setOut('out-status', 'Blad ' + r.status + ': ' + JSON.stringify(r.body), 'err');
+  }
+}
+
+async function arbLoadGames() {
+  var r = await apiFetch('/state');
+  var list = document.getElementById('arb-glist');
+  if (!r.ok) { list.innerHTML = '<div style="color:var(--red);padding:12px">Blad: ' + r.status + '</div>'; return; }
+  var games = Array.isArray(r.body) ? r.body : [];
+  document.getElementById('arb-gcount').textContent = games.length;
+  list.innerHTML = '';
+  if (!games.length) {
+    list.innerHTML = '<div style="padding:20px;text-align:center;color:var(--t3);font-size:.8rem">Brak partii</div>';
+    return;
+  }
+  games.slice().reverse().forEach(g => {
+    var d = document.createElement('div');
+    d.className = 'gitem' + (g.id === arbSelId ? ' sel' : '');
+    var sc = {ongoing:'ongoing',checkmate:'checkmate',stalemate:'stalemate',timeout:'timeout'}[g.status] || 'stalemate';
+    d.innerHTML =
+      '<span class="gi-id">#' + g.id + '</span>' +
+      '<span class="gi-players">' + esc(g.white_player||'Biali') + ' vs ' + esc(g.black_player||'Czarni') + '</span>' +
+      '<span class="gi-status"><span class="pill ' + sc + '">' + g.status + '</span></span>';
+    d.onclick = () => arbSelectGame(g.id);
+    list.appendChild(d);
+  });
+}
+
+async function arbSelectGame(id) {
+  arbSelId = id;
+  document.querySelectorAll('.gitem').forEach(el => {
+    el.classList.toggle('sel', parseInt(el.querySelector('.gi-id').textContent.slice(1)) === id);
+  });
+  document.getElementById('arb-move-gid').value   = id;
+  document.getElementById('arb-status-gid').value = id;
+  var r = await apiFetch('/state?id=' + id);
+  if (!r.ok) { setOut('out-gamedetail', 'Blad pobierania gry', 'err'); return; }
+  var g = r.body;
+  var lines = [
+    'Gra #' + g.id + '  |  Status: ' + g.status + (g.winner ? '  |  Zwyciezca: ' + g.winner : ''),
+    'Biali: ' + (g.white_player||'?') + '  vs  Czarni: ' + (g.black_player||'?'),
+    'Czas kontrolny: ' + (g.time_control ? g.time_control + 's' : 'brak'),
+    'Biali pozostaly: ' + (g.white_time_ms ? (g.white_time_ms/1000).toFixed(1) + 's' : '—') +
+    '  Czarni: ' + (g.black_time_ms ? (g.black_time_ms/1000).toFixed(1) + 's' : '—'),
+    'Liczba ruchow: ' + (g.moves?.length ?? 0),
+    ''
+  ];
+  if (g.moves && g.moves.length) {
+    lines.push('Ostatnie ruchy:');
+    g.moves.slice(-6).forEach(m => {
+      lines.push('  ' + m.move_number + '. [' + m.player + '] ' + m.move + '  @' + m.timestamp);
+    });
+  }
+  setOut('out-gamedetail', lines.join('\n'));
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   TESTY USŁUG
+──────────────────────────────────────────────────────────────────────────── */
+var TESTS = [
+  { name: 'GET /state — lista gier',          fn: testStateList },
+  { name: 'POST /newgame — tworzenie gry',    fn: testNewGame },
+  { name: 'POST /newgame — brak gracza',      fn: testNewGameDefault },
+  { name: 'POST /newgame — kontrola czasu',   fn: testNewGameTC },
+  { name: 'POST /move — zapis ruchu',         fn: testMove },
+  { name: 'POST /move — wiele ruchow',        fn: testMultipleMoves },
+  { name: 'GET /state?id — pojedyncza gra',   fn: testStateById },
+  { name: 'GET /state?id=9999 — 404',         fn: testStateNotFound },
+  { name: 'POST /status — checkmate',         fn: testStatusCheckmate },
+  { name: 'POST /status — stalemate',         fn: testStatusStalemate },
+  { name: 'POST /status — timeout',           fn: testStatusTimeout },
+  { name: 'GET /state — CORS header',         fn: testCORS },
+  { name: 'GET /events — SSE headers',        fn: testSSEHeaders },
+  { name: 'GET / — viewer HTTP 200',          fn: testViewer },
+  { name: 'GET /admin — panel HTTP 200',      fn: testAdmin },
+  { name: 'POST /newgame — GET rejected 405', fn: testMethodNotAllowed },
+  { name: 'POST /move — zly JSON 400',        fn: testMoveInvalidJSON },
+  { name: 'POST /status — zly JSON 400',      fn: testStatusInvalidJSON },
+];
+
+var testGameId = null;
+
+function initTestGrid() {
+  var grid = document.getElementById('test-grid');
+  grid.innerHTML = '';
+  TESTS.forEach((t, i) => {
+    var el = document.createElement('div');
+    el.className = 'test-item';
+    el.id = 'ti-' + i;
+    el.innerHTML =
+      '<div class="test-dot" id="td-' + i + '"></div>' +
+      '<div class="test-name">' + esc(t.name) + '</div>' +
+      '<div class="test-time" id="tt-' + i + '">&#8212;</div>';
+    grid.appendChild(el);
+  });
+}
+
+function testSetState(i, state, ms) {
+  var el = document.getElementById('ti-' + i);
+  var dt = document.getElementById('td-' + i);
+  var tt = document.getElementById('tt-' + i);
+  if (el) { el.className = 'test-item ' + state; }
+  if (tt) tt.textContent = ms !== undefined ? ms + ' ms' : '';
+}
+
+function logLine(html) {
+  var log = document.getElementById('test-log');
+  log.innerHTML += html + '\n';
+  log.scrollTop = log.scrollHeight;
+}
+
+async function runAllTests() {
+  testGameId = null;
+  document.getElementById('test-log').innerHTML = '';
+  document.getElementById('test-summary').style.display = 'none';
+  initTestGrid();
+
+  var btn = document.getElementById('btn-run-tests');
+  btn.disabled = true;
+
+  var pass = 0, fail = 0;
+  var t0 = performance.now();
+
+  logLine('<span class="lg-info">Rozpoczynam testy — ' + TESTS.length + ' przypadkow...</span>');
+
+  for (var i = 0; i < TESTS.length; i++) {
+    var t = TESTS[i];
+    testSetState(i, 'run');
+    var ts = performance.now();
+    try {
+      var result = await t.fn();
+      var ms = Math.round(performance.now() - ts);
+      if (result.pass) {
+        testSetState(i, 'pass', ms);
+        logLine('<span class="lg-ok">  PASS</span>  ' + esc(t.name) + ' <span class="lg-dim">(' + ms + ' ms)</span>');
+        pass++;
+      } else {
+        testSetState(i, 'fail', ms);
+        logLine('<span class="lg-err">  FAIL</span>  ' + esc(t.name) + ' <span class="lg-dim">(' + ms + ' ms)</span>');
+        logLine('<span class="lg-dim">       ' + esc(result.msg || '') + '</span>');
+        fail++;
+      }
+    } catch (e) {
+      var ms = Math.round(performance.now() - ts);
+      testSetState(i, 'fail', ms);
+      logLine('<span class="lg-err">  FAIL</span>  ' + esc(t.name) + ' — wyjątek: ' + esc(String(e)));
+      fail++;
+    }
+    await new Promise(r => setTimeout(r, 30));
+  }
+
+  var total = Math.round(performance.now() - t0);
+  logLine('');
+  logLine('<span class="lg-info">Wynik: ' + pass + '/' + TESTS.length + ' testow przeszlo  (' + total + ' ms)</span>');
+
+  document.getElementById('sum-pass').textContent  = pass;
+  document.getElementById('sum-fail').textContent  = fail;
+  document.getElementById('sum-total').textContent = TESTS.length;
+  document.getElementById('sum-dur').textContent   = total + ' ms';
+  document.getElementById('test-summary').style.display = 'flex';
+
+  btn.disabled = false;
+}
+
+/* ── Implementacje testów ───────────────────────────────────────────────── */
+async function testStateList() {
+  var r = await apiFetch('/state');
+  if (!r.ok) return { pass: false, msg: 'HTTP ' + r.status };
+  if (!Array.isArray(r.body)) return { pass: false, msg: 'Oczekiwano tablicy' };
+  return { pass: true };
+}
+
+async function testNewGame() {
+  var r = await apiFetch('/newgame', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ white_player: 'TestBiali', black_player: 'TestCzarni' })
+  });
+  if (!r.ok) return { pass: false, msg: 'HTTP ' + r.status };
+  if (!r.body.game_id) return { pass: false, msg: 'Brak game_id' };
+  testGameId = r.body.game_id;
+  return { pass: true };
+}
+
+async function testNewGameDefault() {
+  var r = await apiFetch('/newgame', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({})
+  });
+  if (!r.ok) return { pass: false, msg: 'HTTP ' + r.status };
+  if (!r.body.game_id) return { pass: false, msg: 'Brak game_id' };
+  return { pass: true };
+}
+
+async function testNewGameTC() {
+  var r = await apiFetch('/newgame', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ white_player: 'A', black_player: 'B', time_control_ms: 300000 })
+  });
+  if (!r.ok) return { pass: false, msg: 'HTTP ' + r.status };
+  return { pass: true };
+}
+
+async function testMove() {
+  if (!testGameId) return { pass: false, msg: 'Brak testGameId — uruchom testNewGame pierwszy' };
+  var r = await apiFetch('/move', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ game_id: testGameId, move: 'e2e4', player: 'White' })
+  });
+  if (!r.ok) return { pass: false, msg: 'HTTP ' + r.status + ' ' + JSON.stringify(r.body) };
+  if (r.body.move_number !== 1) return { pass: false, msg: 'move_number != 1: ' + r.body.move_number };
+  return { pass: true };
+}
+
+async function testMultipleMoves() {
+  var cr = await apiFetch('/newgame', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ white_player: 'Multi1', black_player: 'Multi2' })
+  });
+  if (!cr.ok) return { pass: false, msg: 'Nie udalo sie utworzyc gry' };
+  var gid = cr.body.game_id;
+  var moves = [
+    { move: 'e2e4', player: 'White' },
+    { move: 'e7e5', player: 'Black' },
+    { move: 'g1f3', player: 'White' },
+    { move: 'b8c6', player: 'Black' },
+  ];
+  for (var m of moves) {
+    var r = await apiFetch('/move', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ game_id: gid, ...m })
+    });
+    if (!r.ok) return { pass: false, msg: 'Ruch ' + m.move + ' odrzucony: ' + r.status };
+  }
+  var sr = await apiFetch('/state?id=' + gid);
+  if (!sr.ok) return { pass: false, msg: 'Nie mozna pobrac stanu' };
+  if ((sr.body.moves?.length ?? 0) !== 4) return { pass: false, msg: 'Oczekiwano 4 ruchy, jest: ' + sr.body.moves?.length };
+  return { pass: true };
+}
+
+async function testStateById() {
+  if (!testGameId) return { pass: false, msg: 'Brak testGameId' };
+  var r = await apiFetch('/state?id=' + testGameId);
+  if (!r.ok) return { pass: false, msg: 'HTTP ' + r.status };
+  if (r.body.id !== testGameId) return { pass: false, msg: 'id niezgodne: ' + r.body.id };
+  if (r.body.white_player !== 'TestBiali') return { pass: false, msg: 'white_player: ' + r.body.white_player };
+  return { pass: true };
+}
+
+async function testStateNotFound() {
+  var r = await apiFetch('/state?id=999999');
+  if (r.status !== 404) return { pass: false, msg: 'Oczekiwano 404, dostano: ' + r.status };
+  return { pass: true };
+}
+
+async function testStatusCheckmate() {
+  var cr = await apiFetch('/newgame', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ white_player: 'X', black_player: 'Y' })
+  });
+  var gid = cr.body.game_id;
+  var r = await apiFetch('/status', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ game_id: gid, status: 'checkmate', winner: 'White' })
+  });
+  if (!r.ok) return { pass: false, msg: 'HTTP ' + r.status };
+  var sr = await apiFetch('/state?id=' + gid);
+  if (sr.body.status !== 'checkmate') return { pass: false, msg: 'status != checkmate: ' + sr.body.status };
+  if (sr.body.winner !== 'White') return { pass: false, msg: 'winner != White' };
+  return { pass: true };
+}
+
+async function testStatusStalemate() {
+  var cr = await apiFetch('/newgame', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ white_player: 'A', black_player: 'B' })
+  });
+  var gid = cr.body.game_id;
+  var r = await apiFetch('/status', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ game_id: gid, status: 'stalemate', winner: '' })
+  });
+  if (!r.ok) return { pass: false, msg: 'HTTP ' + r.status };
+  var sr = await apiFetch('/state?id=' + gid);
+  if (sr.body.status !== 'stalemate') return { pass: false, msg: 'status != stalemate' };
+  return { pass: true };
+}
+
+async function testStatusTimeout() {
+  var cr = await apiFetch('/newgame', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ white_player: 'A', black_player: 'B' })
+  });
+  var gid = cr.body.game_id;
+  var r = await apiFetch('/status', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ game_id: gid, status: 'timeout', winner: 'Black' })
+  });
+  if (!r.ok) return { pass: false, msg: 'HTTP ' + r.status };
+  var sr = await apiFetch('/state?id=' + gid);
+  if (sr.body.winner !== 'Black') return { pass: false, msg: 'winner != Black' };
+  return { pass: true };
+}
+
+async function testCORS() {
+  var r = await apiFetch('/state');
+  var resp = await fetch('/state');
+  var cors = resp.headers.get('Access-Control-Allow-Origin');
+  if (cors !== '*') return { pass: false, msg: 'CORS header: ' + cors };
+  return { pass: true };
+}
+
+async function testSSEHeaders() {
+  try {
+    var ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), 300);
+    var resp = await fetch('/events', { signal: ctrl.signal });
+    var ct = resp.headers.get('content-type') || '';
+    if (!ct.includes('text/event-stream')) return { pass: false, msg: 'Content-Type: ' + ct };
+    return { pass: true };
+  } catch (e) {
+    if (String(e).includes('abort') || String(e).includes('AbortError')) return { pass: true };
+    return { pass: false, msg: String(e) };
+  }
+}
+
+async function testViewer() {
+  var r = await apiFetch('/');
+  if (!r.ok) return { pass: false, msg: 'HTTP ' + r.status };
+  if (typeof r.body !== 'string' || r.body.length < 100) return { pass: false, msg: 'Pusta odpowiedz' };
+  return { pass: true };
+}
+
+async function testAdmin() {
+  var r = await apiFetch('/admin');
+  if (!r.ok && r.status !== 302) return { pass: false, msg: 'HTTP ' + r.status };
+  return { pass: true };
+}
+
+async function testMethodNotAllowed() {
+  var r = await apiFetch('/newgame');
+  if (r.status !== 405) return { pass: false, msg: 'Oczekiwano 405, dostano: ' + r.status };
+  return { pass: true };
+}
+
+async function testMoveInvalidJSON() {
+  try {
+    var resp = await fetch('/move', { method: 'POST', body: 'nie-json!!!', headers: {'Content-Type':'application/json'} });
+    if (resp.status !== 400) return { pass: false, msg: 'Oczekiwano 400, dostano: ' + resp.status };
+    return { pass: true };
+  } catch (e) { return { pass: false, msg: String(e) }; }
+}
+
+async function testStatusInvalidJSON() {
+  try {
+    var resp = await fetch('/status', { method: 'POST', body: 'zepsuty', headers: {'Content-Type':'application/json'} });
+    if (resp.status !== 400) return { pass: false, msg: 'Oczekiwano 400, dostano: ' + resp.status };
+    return { pass: true };
+  } catch (e) { return { pass: false, msg: String(e) }; }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   SPEED TEST
+──────────────────────────────────────────────────────────────────────────── */
+var SPEED_ENDPOINTS = [
+  { label: 'GET /state (lista gier)',    method: 'GET',  path: '/state',   body: null },
+  { label: 'POST /newgame',              method: 'POST', path: '/newgame', body: { white_player:'Bench', black_player:'Test' } },
+  { label: 'GET / (viewer)',             method: 'GET',  path: '/',        body: null },
+  { label: 'GET /admin (panel)',         method: 'GET',  path: '/admin',   body: null },
+  { label: 'GET /events (SSE init)',     method: 'GET',  path: '/events',  body: null, abort: 200 },
+];
+
+async function runSpeedTest() {
+  var btn = document.getElementById('btn-speed');
+  btn.disabled = true;
+  var barsEl = document.getElementById('speed-bars');
+  var logEl  = document.getElementById('speed-log');
+  barsEl.innerHTML = '';
+  logEl.innerHTML  = '';
+  var REPS = 5;
+
+  for (var ep of SPEED_ENDPOINTS) {
+    var times = [];
+    for (var i = 0; i < REPS; i++) {
+      var t0 = performance.now();
+      try {
+        var opts = ep.body ? {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify(ep.body)
+        } : { method: ep.method };
+        if (ep.abort) {
+          var ctrl = new AbortController();
+          opts.signal = ctrl.signal;
+          setTimeout(() => ctrl.abort(), ep.abort);
+        }
+        await fetch(ep.path, opts);
+      } catch (_) {}
+      times.push(Math.round(performance.now() - t0));
+      await new Promise(r => setTimeout(r, 20));
+    }
+    var avg = Math.round(times.reduce((a,b)=>a+b,0)/times.length);
+    var mn  = Math.min(...times);
+    var mx  = Math.max(...times);
+    var maxBar = 800;
+    var pct    = Math.min(100, (avg / maxBar) * 100);
+    var color  = avg < 50 ? 'var(--green)' : avg < 200 ? 'var(--gold)' : 'var(--red)';
+
+    var row = document.createElement('div');
+    row.className = 'speed-row';
+    row.innerHTML =
+      '<div class="speed-label">' + esc(ep.label) + '</div>' +
+      '<div class="speed-track"><div class="speed-fill" style="width:' + pct + '%;background:' + color + '"></div></div>' +
+      '<div class="speed-val" style="color:' + color + '">' + avg + ' ms</div>';
+    barsEl.appendChild(row);
+
+    logEl.innerHTML +=
+      '<span style="color:' + color + '">' + String(avg).padStart(4) + ' ms avg</span>' +
+      '  [min:' + mn + '  max:' + mx + ']  ' + esc(ep.label) + '\n';
+  }
+
+  logEl.innerHTML += '\n<span style="color:var(--primary)">Benchmark zakończony. Kazdy endpoint testowany ' + REPS + 'x.</span>';
+  btn.disabled = false;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   PING MIAST
+──────────────────────────────────────────────────────────────────────────── */
+var CITIES = [
+  { name: 'Warszawa',         url: 'https://www.um.warszawa.pl/favicon.ico' },
+  { name: 'Krakow',           url: 'https://www.krakow.pl/favicon.ico' },
+  { name: 'Lodz',             url: 'https://uml.lodz.pl/favicon.ico' },
+  { name: 'Wroclaw',          url: 'https://www.wroclaw.pl/favicon.ico' },
+  { name: 'Poznan',           url: 'https://www.poznan.pl/favicon.ico' },
+  { name: 'Gdansk',           url: 'https://www.gdansk.pl/favicon.ico' },
+  { name: 'Szczecin',         url: 'https://www.szczecin.pl/favicon.ico' },
+  { name: 'Bydgoszcz',        url: 'https://www.bydgoszcz.pl/favicon.ico' },
+  { name: 'Lublin',           url: 'https://lublin.eu/favicon.ico' },
+  { name: 'Katowice',         url: 'https://www.katowice.eu/favicon.ico' },
+  { name: 'Bialystok',        url: 'https://www.bialystok.pl/favicon.ico' },
+  { name: 'Gdynia',           url: 'https://www.gdynia.pl/favicon.ico' },
+  { name: 'Czestochowa',      url: 'https://czestochowa.pl/favicon.ico' },
+  { name: 'Radom',            url: 'https://www.radom.pl/favicon.ico' },
+  { name: 'Sosnowiec',        url: 'https://www.sosnowiec.pl/favicon.ico' },
+  { name: 'Torun',            url: 'https://www.torun.pl/favicon.ico' },
+  { name: 'Kielce',           url: 'https://www.kielce.eu/favicon.ico' },
+  { name: 'Rzeszow',          url: 'https://erzeszow.pl/favicon.ico' },
+  { name: 'Gliwice',          url: 'https://gliwice.eu/favicon.ico' },
+  { name: 'Zabrze',           url: 'https://www.zabrze.pl/favicon.ico' },
+  { name: 'Olsztyn',          url: 'https://www.olsztyn.eu/favicon.ico' },
+  { name: 'Bytom',            url: 'https://www.bytom.pl/favicon.ico' },
+  { name: 'Bielsko-Biala',    url: 'https://www.bielsko-biala.pl/favicon.ico' },
+  { name: 'Zielona Gora',     url: 'https://www.zielona-gora.pl/favicon.ico' },
+  { name: 'Rybnik',           url: 'https://www.rybnik.pl/favicon.ico' },
+  { name: 'Ruda Slaska',      url: 'https://www.rudaslaska.pl/favicon.ico' },
+  { name: 'Opole',            url: 'https://www.opole.pl/favicon.ico' },
+  { name: 'Tychy',            url: 'https://www.tychy.pl/favicon.ico' },
+  { name: 'Gorzow Wlkp.',     url: 'https://www.gorzow.pl/favicon.ico' },
+  { name: 'Dąbrowa Gornicza', url: 'https://www.dg.pl/favicon.ico' },
+];
+
+function initPingGrid() {
+  var grid = document.getElementById('ping-grid');
+  if (grid.children.length === CITIES.length) return;
+  grid.innerHTML = '';
+  CITIES.forEach((c, i) => {
+    var d = document.createElement('div');
+    d.className = 'ping-row ping-wait';
+    d.id = 'pr-' + i;
+    d.innerHTML =
+      '<div class="ping-dot"></div>' +
+      '<div style="flex:1;min-width:0"><div class="ping-city">' + esc(c.name) + '</div>' +
+        '<div class="ping-bar"><div class="ping-fill" style="width:0%"></div></div>' +
+      '</div>' +
+      '<div class="ping-val">&#8212;</div>';
+    grid.appendChild(d);
+  });
+}
+
+async function pingCity(i) {
+  var c = CITIES[i];
+  var el = document.getElementById('pr-' + i);
+  var valEl = el.querySelector('.ping-val');
+  var fillEl = el.querySelector('.ping-fill');
+
+  var results = [];
+  for (var rep = 0; rep < 3; rep++) {
+    var t0 = performance.now();
+    try {
+      var ctrl = new AbortController();
+      var tid = setTimeout(() => ctrl.abort(), 4000);
+      await fetch(c.url + '?_=' + Date.now(), { signal: ctrl.signal, mode: 'no-cors', cache: 'no-store' });
+      clearTimeout(tid);
+      results.push(Math.round(performance.now() - t0));
+    } catch (e) {
+      clearTimeout(tid);
+      if (!String(e).includes('AbortError')) {
+        results.push(Math.round(performance.now() - t0));
+      } else {
+        valEl.textContent = 'timeout';
+        el.className = 'ping-row ping-bad';
+        return;
+      }
+    }
+    await new Promise(r => setTimeout(r, 80));
+  }
+
+  var avg = Math.round(results.reduce((a,b)=>a+b,0)/results.length);
+  var cls = avg < 100 ? 'ping-good' : avg < 300 ? 'ping-mid' : 'ping-bad';
+  var maxMs = 600;
+  var pct = Math.min(100, (avg / maxMs) * 100);
+
+  el.className = 'ping-row ' + cls;
+  valEl.textContent = avg + ' ms';
+  fillEl.style.width = pct + '%';
+}
+
+async function runPingTest() {
+  initPingGrid();
+  var btn = document.getElementById('btn-ping');
+  btn.disabled = true;
+
+  CITIES.forEach((_, i) => {
+    var el = document.getElementById('pr-' + i);
+    el.className = 'ping-row ping-wait';
+    el.querySelector('.ping-val').textContent = '...';
+    el.querySelector('.ping-fill').style.width = '0%';
+  });
+
+  var batch = 6;
+  for (var i = 0; i < CITIES.length; i += batch) {
+    var chunk = CITIES.slice(i, i + batch).map((_, j) => pingCity(i + j));
+    await Promise.all(chunk);
+    await new Promise(r => setTimeout(r, 100));
+  }
+
+  btn.disabled = false;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   UTILS
+──────────────────────────────────────────────────────────────────────────── */
+function esc(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+/* ── INIT ─────────────────────────────────────────────────────────────────── */
+initTestGrid();
+initPingGrid();
+arbLoadGames();
+</script>
+</body>
+</html>
