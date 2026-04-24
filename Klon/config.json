@@ -1,0 +1,26 @@
+{
+  "server": {
+    "port": 8080,
+    "host": "0.0.0.0"
+  },
+  "database": {
+    "path": "./chess.db",
+    "wal_mode": true
+  },
+  "chess": {
+    "default_time_control_minutes": 5,
+    "default_increment_seconds": 0,
+    "white_player_default": "White",
+    "black_player_default": "Black"
+  },
+  "files": {
+    "games_directory": "./gry",
+    "save_pgn": true,
+    "save_json": true
+  },
+  "viewer": {
+    "viewer_file": "viewer.html",
+    "enable_sse": true,
+    "keepalive_interval_seconds": 30
+  }
+}
