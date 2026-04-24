@@ -1,0 +1,1145 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Panel Arbitra — Chess Relay</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+
+:root{
+  --bg:#1c1c1e;
+  --surface:#28282c;
+  --surface2:#313138;
+  --border:#3a3a42;
+  --primary:#3092e7;
+  --primary-dim:rgba(48,146,231,.15);
+  --gold:#e5c158;
+  --gold-dim:rgba(229,193,88,.15);
+  --orange:#cd7b00;
+  --orange-dim:rgba(205,123,0,.15);
+  --green:#4caf7d;
+  --green-dim:rgba(76,175,125,.15);
+  --red:#e05252;
+  --red-dim:rgba(224,82,82,.15);
+  --neutral:#74777e;
+  --text:#e8edf5;
+  --text-muted:#9da3ad;
+  --radius:10px;
+  --radius-sm:6px;
+  --sidebar:240px;
+  --font-head:'Space Grotesk',system-ui,sans-serif;
+  --font-body:'Inter',system-ui,sans-serif;
+  --font-mono:'JetBrains Mono',monospace;
+}
+
+body{
+  font-family:var(--font-body);
+  background:var(--bg);
+  color:var(--text);
+  display:flex;
+  min-height:100vh;
+  font-size:14px;
+  line-height:1.5;
+}
+
+/* ─── Sidebar ─────────────────────────────────────────────────── */
+.sidebar{
+  width:var(--sidebar);
+  min-height:100vh;
+  background:var(--surface);
+  border-right:1px solid var(--border);
+  display:flex;
+  flex-direction:column;
+  flex-shrink:0;
+  position:fixed;
+  top:0;left:0;bottom:0;
+}
+.sb-brand{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  padding:20px 18px 16px;
+  border-bottom:1px solid var(--border);
+}
+.sb-brand-icon{
+  width:32px;height:32px;
+  background:var(--primary-dim);
+  border:1px solid var(--primary);
+  border-radius:var(--radius-sm);
+  display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;
+}
+.sb-brand-icon svg{stroke:var(--primary);fill:none}
+.sb-brand-text{font-family:var(--font-head);font-weight:700;font-size:15px;color:var(--text);line-height:1.2}
+.sb-brand-sub{font-size:11px;color:var(--gold);font-weight:600;letter-spacing:.04em;text-transform:uppercase}
+
+.sb-section{
+  padding:14px 12px 6px;
+  font-size:10px;
+  font-weight:600;
+  letter-spacing:.08em;
+  text-transform:uppercase;
+  color:var(--neutral);
+}
+.sb-nav{flex:1;padding:4px 8px;overflow-y:auto}
+.sb-item{
+  display:flex;align-items:center;gap:10px;
+  padding:9px 10px;
+  border-radius:var(--radius-sm);
+  cursor:pointer;
+  color:var(--text-muted);
+  font-size:13.5px;
+  font-weight:500;
+  transition:background .15s,color .15s;
+  margin-bottom:2px;
+  border:none;
+  background:none;
+  width:100%;
+  text-align:left;
+}
+.sb-item:hover{background:var(--surface2);color:var(--text)}
+.sb-item.active{background:var(--primary-dim);color:var(--primary)}
+.sb-item svg{flex-shrink:0;width:16px;height:16px;stroke:currentColor;fill:none}
+
+.sb-footer{
+  padding:12px 14px;
+  border-top:1px solid var(--border);
+}
+.sb-server{
+  font-size:11px;color:var(--text-muted);
+  display:flex;align-items:center;gap:6px;
+}
+.sb-dot{
+  width:7px;height:7px;border-radius:50%;
+  background:var(--green);
+  box-shadow:0 0 6px var(--green);
+}
+
+/* ─── Main ────────────────────────────────────────────────────── */
+.main{
+  margin-left:var(--sidebar);
+  flex:1;
+  display:flex;
+  flex-direction:column;
+  min-height:100vh;
+}
+.topbar{
+  height:56px;
+  background:var(--surface);
+  border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;
+  padding:0 24px;
+  position:sticky;top:0;z-index:10;
+}
+.topbar-title{
+  font-family:var(--font-head);
+  font-weight:700;
+  font-size:16px;
+}
+.topbar-badge{
+  font-size:11px;font-weight:600;letter-spacing:.04em;
+  background:var(--gold-dim);
+  color:var(--gold);
+  border:1px solid var(--gold);
+  border-radius:20px;
+  padding:2px 10px;
+}
+.content{padding:24px;flex:1}
+
+/* ─── Section panes ───────────────────────────────────────────── */
+.pane{display:none}
+.pane.active{display:block}
+
+/* ─── Cards ───────────────────────────────────────────────────── */
+.card{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  padding:20px;
+  margin-bottom:18px;
+}
+.card-title{
+  font-family:var(--font-head);
+  font-weight:600;
+  font-size:14px;
+  margin-bottom:14px;
+  color:var(--text);
+  display:flex;align-items:center;gap:8px;
+}
+.card-title svg{stroke:var(--primary);fill:none;width:16px;height:16px}
+
+/* ─── Game selector ───────────────────────────────────────────── */
+.game-select-row{
+  display:flex;align-items:center;gap:10px;
+  margin-bottom:18px;
+}
+.game-select-row label{
+  font-weight:600;font-size:13px;color:var(--text-muted);white-space:nowrap;
+}
+
+/* ─── Form controls ───────────────────────────────────────────── */
+.form-grid{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:12px;
+  margin-bottom:14px;
+}
+.form-grid.cols3{grid-template-columns:1fr 1fr 1fr}
+.form-grid.cols1{grid-template-columns:1fr}
+.field{display:flex;flex-direction:column;gap:4px}
+.field label{font-size:12px;font-weight:600;color:var(--text-muted)}
+input[type=text],input[type=number],select,textarea{
+  background:var(--surface2);
+  border:1px solid var(--border);
+  border-radius:var(--radius-sm);
+  color:var(--text);
+  font-family:var(--font-body);
+  font-size:13px;
+  padding:8px 11px;
+  transition:border .15s;
+  width:100%;
+}
+input:focus,select:focus,textarea:focus{
+  outline:none;border-color:var(--primary);
+}
+select option{background:var(--surface2)}
+textarea{resize:vertical;min-height:60px}
+
+/* ─── Buttons ─────────────────────────────────────────────────── */
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:7px;
+  padding:9px 16px;
+  border-radius:var(--radius-sm);
+  font-family:var(--font-head);
+  font-weight:600;
+  font-size:13px;
+  cursor:pointer;
+  border:none;
+  transition:opacity .15s,transform .1s;
+  white-space:nowrap;
+}
+.btn:hover{opacity:.88}
+.btn:active{transform:scale(.97)}
+.btn-primary{background:var(--primary);color:#fff}
+.btn-gold{background:var(--gold);color:#1c1c1e}
+.btn-orange{background:var(--orange);color:#fff}
+.btn-red{background:var(--red);color:#fff}
+.btn-green{background:var(--green);color:#1c1c1e}
+.btn-ghost{background:var(--surface2);color:var(--text);border:1px solid var(--border)}
+.btn svg{width:14px;height:14px;stroke:currentColor;fill:none;flex-shrink:0}
+.btn-sm{padding:6px 12px;font-size:12px}
+
+/* ─── Action groups ───────────────────────────────────────────── */
+.actions-row{
+  display:flex;gap:8px;flex-wrap:wrap;
+  margin-top:12px;
+}
+
+/* ─── Game table ──────────────────────────────────────────────── */
+.game-table{width:100%;border-collapse:collapse;font-size:13px}
+.game-table th{
+  text-align:left;padding:8px 12px;
+  color:var(--text-muted);font-weight:600;font-size:11px;
+  letter-spacing:.05em;text-transform:uppercase;
+  border-bottom:1px solid var(--border);
+}
+.game-table td{
+  padding:9px 12px;
+  border-bottom:1px solid var(--border);
+  vertical-align:middle;
+}
+.game-table tr:last-child td{border-bottom:none}
+.game-table tr:hover td{background:var(--surface2)}
+.game-table .select-row{cursor:pointer}
+.game-table .select-row td{cursor:pointer}
+
+/* ─── Status pill ─────────────────────────────────────────────── */
+.pill{
+  display:inline-flex;align-items:center;gap:4px;
+  padding:2px 8px;border-radius:20px;
+  font-size:11px;font-weight:600;letter-spacing:.03em;
+  text-transform:capitalize;
+}
+.pill-ongoing{background:var(--green-dim);color:var(--green);border:1px solid var(--green)}
+.pill-paused{background:var(--gold-dim);color:var(--gold);border:1px solid var(--gold)}
+.pill-finished,.pill-checkmate,.pill-stalemate,.pill-forfeit,.pill-draw{
+  background:var(--surface2);color:var(--text-muted);border:1px solid var(--border)}
+.pill-timeout{background:var(--red-dim);color:var(--red);border:1px solid var(--red)}
+
+/* ─── Clock display ───────────────────────────────────────────── */
+.clock-display{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:16px;
+  margin-bottom:16px;
+}
+.clock-side{
+  background:var(--surface2);
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  padding:16px;
+  text-align:center;
+}
+.clock-side.white-side{border-top:3px solid #e8edf5}
+.clock-side.black-side{border-top:3px solid #3a3a42}
+.clock-name{font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:4px}
+.clock-time{
+  font-family:var(--font-mono);
+  font-size:28px;
+  font-weight:600;
+  color:var(--text);
+  letter-spacing:.04em;
+}
+.clock-time.low{color:var(--red)}
+.clock-active{
+  font-size:11px;margin-top:4px;
+  color:var(--neutral);
+}
+.clock-active.ticking{color:var(--green)}
+
+/* ─── Log ─────────────────────────────────────────────────────── */
+.log-box{
+  background:var(--bg);
+  border:1px solid var(--border);
+  border-radius:var(--radius-sm);
+  padding:12px;
+  font-family:var(--font-mono);
+  font-size:12px;
+  color:var(--text-muted);
+  max-height:200px;
+  overflow-y:auto;
+  line-height:1.6;
+}
+.log-entry{margin-bottom:2px}
+.log-ok{color:var(--green)}
+.log-err{color:var(--red)}
+.log-info{color:var(--primary)}
+.log-warn{color:var(--gold)}
+
+/* ─── Divider label ───────────────────────────────────────────── */
+.divider-label{
+  display:flex;align-items:center;gap:10px;
+  margin:20px 0 14px;
+  color:var(--text-muted);
+  font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+}
+.divider-label::before,.divider-label::after{
+  content:'';flex:1;height:1px;background:var(--border);
+}
+
+/* ─── Overview grid ───────────────────────────────────────────── */
+.overview-grid{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:14px;
+  margin-bottom:20px;
+}
+.stat-card{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  padding:16px;
+}
+.stat-icon{
+  width:36px;height:36px;
+  border-radius:var(--radius-sm);
+  display:flex;align-items:center;justify-content:center;
+  margin-bottom:10px;
+}
+.stat-icon svg{width:18px;height:18px;stroke:currentColor;fill:none}
+.stat-icon.blue{background:var(--primary-dim);color:var(--primary)}
+.stat-icon.gold{background:var(--gold-dim);color:var(--gold)}
+.stat-icon.green{background:var(--green-dim);color:var(--green)}
+.stat-value{font-family:var(--font-head);font-weight:700;font-size:24px;color:var(--text)}
+.stat-label{font-size:12px;color:var(--text-muted);margin-top:2px}
+
+/* ─── Rule note ───────────────────────────────────────────────── */
+.rule-note{
+  display:flex;align-items:flex-start;gap:8px;
+  background:var(--primary-dim);
+  border:1px solid rgba(48,146,231,.3);
+  border-radius:var(--radius-sm);
+  padding:10px 12px;
+  font-size:12px;
+  color:var(--text-muted);
+  margin-bottom:14px;
+}
+.rule-note strong{color:var(--primary)}
+.rule-note svg{flex-shrink:0;width:14px;height:14px;stroke:var(--primary);fill:none;margin-top:1px}
+.rule-warn{
+  background:var(--gold-dim);
+  border-color:rgba(229,193,88,.3);
+}
+.rule-warn svg{stroke:var(--gold)}
+.rule-warn strong{color:var(--gold)}
+.rule-danger{
+  background:var(--red-dim);
+  border-color:rgba(224,82,82,.3);
+}
+.rule-danger svg{stroke:var(--red)}
+.rule-danger strong{color:var(--red)}
+
+/* ─── Scrollbar ───────────────────────────────────────────────── */
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--neutral)}
+
+/* ─── Responsive ──────────────────────────────────────────────── */
+@media(max-width:900px){
+  .sidebar{display:none}
+  .main{margin-left:0}
+  .form-grid{grid-template-columns:1fr}
+  .overview-grid{grid-template-columns:1fr 1fr}
+}
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════════ SIDEBAR ════════════════════════════ -->
+<aside class="sidebar">
+  <div class="sb-brand">
+    <div class="sb-brand-icon">
+      <svg width="18" height="18" viewBox="0 0 24 24" stroke-width="1.8">
+        <rect x="2" y="2" width="9" height="9"/><rect x="13" y="2" width="9" height="9"/>
+        <rect x="2" y="13" width="9" height="9"/><rect x="13" y="13" width="9" height="9"/>
+      </svg>
+    </div>
+    <div>
+      <div class="sb-brand-text">Chess Relay</div>
+      <div class="sb-brand-sub">Arbiter</div>
+    </div>
+  </div>
+
+  <nav class="sb-nav">
+    <div class="sb-section">Widoki</div>
+    <button class="sb-item active" onclick="showPane('overview')">
+      <svg viewBox="0 0 24 24" stroke-width="1.8"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+      Przegląd
+    </button>
+    <button class="sb-item" onclick="showPane('clock')">
+      <svg viewBox="0 0 24 24" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+      Zegar / Czas
+    </button>
+    <button class="sb-item" onclick="showPane('irregularities')">
+      <svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      Nieprawidłowości
+    </button>
+    <button class="sb-item" onclick="showPane('result')">
+      <svg viewBox="0 0 24 24" stroke-width="1.8"><polyline points="20 6 9 17 4 12"/></svg>
+      Wynik partii
+    </button>
+    <button class="sb-item" onclick="showPane('players')">
+      <svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/></svg>
+      Zawodnicy
+    </button>
+    <div class="sb-section">Dziennik</div>
+    <button class="sb-item" onclick="showPane('log')">
+      <svg viewBox="0 0 24 24" stroke-width="1.8"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+      Dziennik akcji
+    </button>
+  </nav>
+
+  <div class="sb-footer">
+    <div class="sb-server">
+      <div class="sb-dot" id="conn-dot"></div>
+      <span id="conn-label">Łączenie...</span>
+    </div>
+  </div>
+</aside>
+
+<!-- ═══════════════════════ MAIN ════════════════════════════════ -->
+<div class="main">
+  <div class="topbar">
+    <span class="topbar-title">Panel Arbitra — FIDE Art. 6 &amp; 7</span>
+    <span class="topbar-badge" id="active-game-label">Brak wybranej partii</span>
+  </div>
+
+  <div class="content">
+
+    <!-- ── Global game selector ─────────────────────────────────── -->
+    <div class="card">
+      <div class="card-title">
+        <svg viewBox="0 0 24 24" stroke-width="1.8"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        Wybór partii
+      </div>
+      <div class="game-select-row">
+        <label>Aktywna partia:</label>
+        <select id="game-select" onchange="onGameSelect()" style="max-width:360px">
+          <option value="">— wybierz partię —</option>
+        </select>
+        <button class="btn btn-ghost btn-sm" onclick="loadGames()">
+          <svg viewBox="0 0 24 24" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          Odśwież
+        </button>
+      </div>
+      <div class="clock-display" id="clock-display" style="display:none">
+        <div class="clock-side white-side">
+          <div class="clock-name" id="w-name">Białe</div>
+          <div class="clock-time" id="w-time">—:——</div>
+          <div class="clock-active" id="w-active"></div>
+        </div>
+        <div class="clock-side black-side">
+          <div class="clock-name" id="b-name">Czarne</div>
+          <div class="clock-time" id="b-time">—:——</div>
+          <div class="clock-active" id="b-active"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════════ PANE: Przegląd ══════════════════════════ -->
+    <div class="pane active" id="pane-overview">
+      <div class="overview-grid" id="stat-grid">
+        <div class="stat-card">
+          <div class="stat-icon blue">
+            <svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+          </div>
+          <div class="stat-value" id="ov-total">—</div>
+          <div class="stat-label">Wszystkich partii</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon green">
+            <svg viewBox="0 0 24 24" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          </div>
+          <div class="stat-value" id="ov-ongoing">—</div>
+          <div class="stat-label">Trwających partii</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon gold">
+            <svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+          </div>
+          <div class="stat-value" id="ov-paused">—</div>
+          <div class="stat-label">Wstrzymanych</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+          Wszystkie partie
+        </div>
+        <div style="overflow-x:auto">
+          <table class="game-table">
+            <thead>
+              <tr>
+                <th>#</th><th>Białe</th><th>Czarne</th>
+                <th>Status</th><th>Ruchy</th><th>Zegar B/C</th><th>Akcja</th>
+              </tr>
+            </thead>
+            <tbody id="games-tbody">
+              <tr><td colspan="7" style="text-align:center;color:var(--text-muted);padding:24px">Ładowanie...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════════ PANE: Zegar ══════════════════════════════ -->
+    <div class="pane" id="pane-clock">
+
+      <!-- Pause / Resume -->
+      <div class="card">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><line x1="10" y1="15" x2="10" y2="9"/><line x1="14" y1="15" x2="14" y2="9"/></svg>
+          Pauza / Wznowienie — Art. 6.11
+        </div>
+        <div class="rule-note">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <span><strong>Art. 6.11.1:</strong> Sędzia może wstrzymać zegary w każdej chwili gdy jest to konieczne (np. wymienianie zegara, art. 6.11.3 — wznowienie).</span>
+        </div>
+        <div class="actions-row">
+          <button class="btn btn-gold" onclick="arbiterPause()">
+            <svg viewBox="0 0 24 24" stroke-width="2"><line x1="10" y1="15" x2="10" y2="9"/><line x1="14" y1="15" x2="14" y2="9"/></svg>
+            Wstrzymaj partię
+          </button>
+          <button class="btn btn-green" onclick="arbiterResume()">
+            <svg viewBox="0 0 24 24" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            Wznów partię
+          </button>
+        </div>
+        <div class="field" style="margin-top:12px;max-width:460px">
+          <label>Powód wstrzymania / notatka</label>
+          <input type="text" id="pause-reason" placeholder="np. wymiana zegara, przerwa techniczna">
+        </div>
+      </div>
+
+      <!-- Adjust clock -->
+      <div class="card">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><polyline points="12 7 12 12 15 15"/><path d="M4.9 4.9l14.2 14.2"/></svg>
+          Korekta zegara — Art. 6.10.2, 7.1
+        </div>
+        <div class="rule-note">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <span><strong>Art. 6.10.2:</strong> Sędzia może ustawić czas na zegarze jeśli wykryto nieprawidłowe wskazanie.</span>
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label>Czas Białych (mm:ss)</label>
+            <input type="text" id="adj-white" placeholder="np. 12:30">
+          </div>
+          <div class="field">
+            <label>Czas Czarnych (mm:ss)</label>
+            <input type="text" id="adj-black" placeholder="np. 08:45">
+          </div>
+          <div class="field" style="grid-column:1/-1">
+            <label>Powód korekty</label>
+            <input type="text" id="adj-reason" placeholder="np. wykryto nieprawidłowe wskazanie zegara">
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="arbiterAdjustClock()">
+          <svg viewBox="0 0 24 24" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+          Zastosuj korektę
+        </button>
+      </div>
+
+      <!-- Add time bonus -->
+      <div class="card">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+          Bonifikata czasu — Art. 7.5.5
+        </div>
+        <div class="rule-note">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <span><strong>Art. 7.5.5:</strong> Za pierwsze nielegalne posunięcie sędzia dodaje 2 minuty do czasu <em>przeciwnika</em> nielegalnie grającego.</span>
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label>Gracz otrzymujący bonifikatę</label>
+            <select id="bonus-player">
+              <option value="White">Białe</option>
+              <option value="Black">Czarne</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Czas bonifikaty (sekundy)</label>
+            <input type="number" id="bonus-sec" value="120" min="1">
+          </div>
+          <div class="field" style="grid-column:1/-1">
+            <label>Powód</label>
+            <input type="text" id="bonus-reason" placeholder="np. pierwsze nielegalne posunięcie przeciwnika">
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="arbiterAddTime()">
+          <svg viewBox="0 0 24 24" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+          Dodaj bonifikatę
+        </button>
+      </div>
+
+      <!-- Replace clock / set time control -->
+      <div class="card">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          Wymiana zegara / Nowa kontrola czasu — Art. 6.10.1
+        </div>
+        <div class="rule-note rule-warn">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+          <span><strong>Art. 6.10.1:</strong> Przy wymianie zegara sędzia ustala nowy czas na podstawie najlepszej oceny, zgodnie z przepisami.</span>
+        </div>
+        <div class="form-grid cols3">
+          <div class="field">
+            <label>Kontrola czasu (sek)</label>
+            <input type="number" id="tc-control" placeholder="np. 900" min="60">
+          </div>
+          <div class="field">
+            <label>Nowy czas Białych (mm:ss)</label>
+            <input type="text" id="tc-white" placeholder="np. 15:00">
+          </div>
+          <div class="field">
+            <label>Nowy czas Czarnych (mm:ss)</label>
+            <input type="text" id="tc-black" placeholder="np. 15:00">
+          </div>
+        </div>
+        <button class="btn btn-orange" onclick="arbiterSetTimeControl()">
+          <svg viewBox="0 0 24 24" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          Ustaw nową kontrolę czasu
+        </button>
+      </div>
+    </div>
+
+    <!-- ══════════════ PANE: Nieprawidłowości ═══════════════════ -->
+    <div class="pane" id="pane-irregularities">
+
+      <!-- Delete last move -->
+      <div class="card">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 00-4-4H4"/></svg>
+          Cofnięcie ruchu — Art. 7.5.1
+        </div>
+        <div class="rule-note">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <span><strong>Art. 7.5.1:</strong> Sędzia przywraca pozycję sprzed nieprawidłowego posunięcia. W razie niemożności — partia jest unieważniana.</span>
+        </div>
+        <div class="field" style="margin-bottom:12px;max-width:460px">
+          <label>Powód cofnięcia ruchu</label>
+          <input type="text" id="del-reason" placeholder="np. nielegalne posunięcie (niedozwolone ruszenie króla)">
+        </div>
+        <div class="rule-note rule-warn">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+          <span>Usuwa tylko ostatni ruch z bazy. Sędzia odpowiada za przywrócenie fizycznej pozycji na szachownicy.</span>
+        </div>
+        <button class="btn btn-gold" onclick="arbiterDeleteMove()">
+          <svg viewBox="0 0 24 24" stroke-width="2"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 00-4-4H4"/></svg>
+          Cofnij ostatni ruch
+        </button>
+      </div>
+
+      <!-- Void game -->
+      <div class="card">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>
+          Unieważnienie partii — Art. 7.2.1
+        </div>
+        <div class="rule-note rule-danger">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+          <span><strong>Art. 7.2.1:</strong> Jeżeli niemożliwe jest przywrócenie pozycji, sędzia unieważnia partię. Kasuje <em>wszystkie</em> ruchy i zeruje wynik.</span>
+        </div>
+        <div class="field" style="margin-bottom:12px;max-width:460px">
+          <label>Powód unieważnienia</label>
+          <input type="text" id="void-reason" placeholder="np. nieprawidłowe ustawienie figur od początku">
+        </div>
+        <button class="btn btn-red" onclick="arbiterVoid()">
+          <svg viewBox="0 0 24 24" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>
+          Unieważnij partię
+        </button>
+      </div>
+    </div>
+
+    <!-- ══════════════ PANE: Wynik partii ═══════════════════════ -->
+    <div class="pane" id="pane-result">
+
+      <!-- Forfeit -->
+      <div class="card">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          Przegrana przez arbitra — Art. 7.5.5, 6.7.1
+        </div>
+        <div class="rule-note rule-danger">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+          <span><strong>Art. 7.5.5:</strong> Drugie nielegalne posunięcie lub spóźnienie powyżej 15 min (Art. 6.7.1) skutkuje przegraną przez arbitra.</span>
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label>Przegrywający gracz</label>
+            <select id="forfeit-loser">
+              <option value="White">Białe</option>
+              <option value="Black">Czarne</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Podstawa prawna</label>
+            <select id="forfeit-basis">
+              <option value="Art. 7.5.5 — drugie nielegalne posunięcie">Art. 7.5.5 — drugie nielegalne posunięcie</option>
+              <option value="Art. 6.7.1 — spóźnienie ponad 15 min">Art. 6.7.1 — spóźnienie ponad 15 min</option>
+              <option value="Inne">Inne</option>
+            </select>
+          </div>
+          <div class="field" style="grid-column:1/-1">
+            <label>Dodatkowe uwagi</label>
+            <input type="text" id="forfeit-reason" placeholder="opcjonalne uwagi sędziego">
+          </div>
+        </div>
+        <button class="btn btn-red" onclick="arbiterForfeit()">
+          <svg viewBox="0 0 24 24" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+          Ogłoś przegraną
+        </button>
+      </div>
+
+      <!-- Arbiter draw -->
+      <div class="card">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Remis orzeczony przez arbitra — Art. 6.9
+        </div>
+        <div class="rule-note">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <span><strong>Art. 6.9:</strong> Sędzia ogłasza remis gdy pozycja jest martwa — żadna ze stron nie może zamatować króla nawet przy najgorszej grze obydwu.</span>
+        </div>
+        <div class="form-grid cols1">
+          <div class="field">
+            <label>Podstawa ogłoszenia remisu</label>
+            <input type="text" id="draw-reason" placeholder="np. brak materiału do mata — obie strony mają tylko króla">
+          </div>
+        </div>
+        <button class="btn btn-ghost" onclick="arbiterDraw()">
+          <svg viewBox="0 0 24 24" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Ogłoś remis
+        </button>
+      </div>
+
+      <!-- Flag fall -->
+      <div class="card">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          Upływ czasu — Art. 6.8
+        </div>
+        <div class="rule-note rule-warn">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+          <span><strong>Art. 6.8:</strong> Sędzia stwierdza, że gracz przekroczył czas (flaga opadła) i ogłasza przegraną, chyba że przeciwnik nie może zamatować.</span>
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label>Gracz z opadłą flagą</label>
+            <select id="flag-loser">
+              <option value="White">Białe</option>
+              <option value="Black">Czarne</option>
+            </select>
+          </div>
+        </div>
+        <button class="btn btn-red" onclick="arbiterFlagFall()">
+          <svg viewBox="0 0 24 24" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          Ogłoś upływ czasu
+        </button>
+      </div>
+    </div>
+
+    <!-- ══════════════ PANE: Zawodnicy ═══════════════════════════ -->
+    <div class="pane" id="pane-players">
+      <div class="card">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/></svg>
+          Zmiana zawodników / kolory — Art. 7.3
+        </div>
+        <div class="rule-note">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <span><strong>Art. 7.3:</strong> Jeżeli błędne kolory zostaną stwierdzone przed wykonaniem 10. ruchu, sędzia wymienia zawodników miejscami. Pozycja jest przetaczana.</span>
+        </div>
+
+        <div class="divider-label">Zamiana kolorów</div>
+        <div class="rule-note rule-warn">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+          <span>Zamienia białego i czarnego gracza miejscami w bazie — tylko gdy gra jest przed 10. ruchem zgodnie z Art. 7.3.</span>
+        </div>
+        <button class="btn btn-orange" onclick="arbiterSwapColors()">
+          <svg viewBox="0 0 24 24" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 014-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg>
+          Zamień kolory
+        </button>
+
+        <div class="divider-label">Ustaw nazwy zawodników</div>
+        <div class="form-grid">
+          <div class="field">
+            <label>Gracz Białymi</label>
+            <input type="text" id="sp-white" placeholder="Imię i nazwisko">
+          </div>
+          <div class="field">
+            <label>Gracz Czarnymi</label>
+            <input type="text" id="sp-black" placeholder="Imię i nazwisko">
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="arbiterSetPlayers()">
+          <svg viewBox="0 0 24 24" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+          Zapisz zawodników
+        </button>
+      </div>
+    </div>
+
+    <!-- ══════════════ PANE: Dziennik ═══════════════════════════ -->
+    <div class="pane" id="pane-log">
+      <div class="card">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24" stroke-width="1.8"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+          Dziennik akcji arbitra
+        </div>
+        <div style="display:flex;justify-content:flex-end;margin-bottom:10px">
+          <button class="btn btn-ghost btn-sm" onclick="clearLog()">Wyczyść dziennik</button>
+        </div>
+        <div class="log-box" id="main-log">
+          <div class="log-entry log-info">[system] Panel arbitra uruchomiony.</div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /content -->
+</div><!-- /main -->
+
+<script>
+// ─── State ──────────────────────────────────────────────────────────────────
+let selectedGameId = null;
+let games = [];
+let clockInterval = null;
+let lastState = null;
+
+// ─── Navigation ──────────────────────────────────────────────────────────────
+function showPane(name) {
+  document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
+  document.getElementById('pane-' + name).classList.add('active');
+  document.querySelectorAll('.sb-item').forEach(b => {
+    b.classList.toggle('active', b.getAttribute('onclick') === `showPane('${name}')`);
+  });
+}
+
+// ─── Log ─────────────────────────────────────────────────────────────────────
+function log(msg, cls) {
+  const box = document.getElementById('main-log');
+  const ts = new Date().toLocaleTimeString('pl-PL', {hour12:false});
+  const div = document.createElement('div');
+  div.className = 'log-entry ' + (cls || '');
+  div.textContent = `[${ts}] ${msg}`;
+  box.prepend(div);
+}
+function clearLog() {
+  document.getElementById('main-log').innerHTML = '';
+  log('Dziennik wyczyszczony.', 'log-info');
+}
+
+// ─── Time helpers ─────────────────────────────────────────────────────────────
+function msToDisplay(ms) {
+  if (ms === null || ms === undefined) return '—:——';
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2,'0')}`;
+}
+function parseTime(str) {
+  if (!str) return null;
+  const parts = str.split(':');
+  if (parts.length === 2) {
+    const m = parseInt(parts[0],10);
+    const s = parseInt(parts[1],10);
+    if (!isNaN(m) && !isNaN(s)) return (m * 60 + s) * 1000;
+  }
+  return null;
+}
+
+// ─── Game loading ─────────────────────────────────────────────────────────────
+async function loadGames() {
+  try {
+    const r = await fetch('/state');
+    const data = await r.json();
+    games = Array.isArray(data) ? data : [data];
+    games.sort((a,b) => b.id - a.id);
+
+    const sel = document.getElementById('game-select');
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">— wybierz partię —</option>';
+    games.forEach(g => {
+      const opt = document.createElement('option');
+      opt.value = g.id;
+      opt.textContent = `#${g.id} — ${g.white_player||'Białe'} vs ${g.black_player||'Czarne'} [${g.status}]`;
+      sel.appendChild(opt);
+    });
+    if (prev) sel.value = prev;
+
+    renderGamesTable();
+    updateStats();
+
+    if (selectedGameId) {
+      const g = games.find(x => x.id == selectedGameId);
+      if (g) updateClockDisplay(g);
+    }
+
+    document.getElementById('conn-dot').style.background = 'var(--green)';
+    document.getElementById('conn-label').textContent = 'Połączono';
+  } catch(e) {
+    document.getElementById('conn-dot').style.background = 'var(--red)';
+    document.getElementById('conn-label').textContent = 'Błąd połączenia';
+    log('Błąd ładowania partii: ' + e.message, 'log-err');
+  }
+}
+
+function updateStats() {
+  const total = games.length;
+  const ongoing = games.filter(g => g.status === 'ongoing').length;
+  const paused = games.filter(g => g.status === 'paused').length;
+  document.getElementById('ov-total').textContent = total;
+  document.getElementById('ov-ongoing').textContent = ongoing;
+  document.getElementById('ov-paused').textContent = paused;
+}
+
+function statusPill(status) {
+  const cls = {
+    ongoing:'pill-ongoing',paused:'pill-paused',
+    checkmate:'pill-checkmate',stalemate:'pill-stalemate',
+    timeout:'pill-timeout',forfeit:'pill-finished',
+    draw:'pill-finished',finished:'pill-finished'
+  }[status] || 'pill-finished';
+  const labels = {
+    ongoing:'w toku',paused:'pauza',checkmate:'mat',
+    stalemate:'pat',timeout:'czas',forfeit:'przegrana',
+    draw:'remis',finished:'zakończona'
+  };
+  return `<span class="pill ${cls}">${labels[status]||status}</span>`;
+}
+
+function renderGamesTable() {
+  const tbody = document.getElementById('games-tbody');
+  if (!games.length) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--text-muted);padding:24px">Brak partii</td></tr>';
+    return;
+  }
+  tbody.innerHTML = games.map(g => `
+    <tr>
+      <td><span style="font-family:var(--font-mono);color:var(--text-muted)">#${g.id}</span></td>
+      <td>${g.white_player||'—'}</td>
+      <td>${g.black_player||'—'}</td>
+      <td>${statusPill(g.status)}</td>
+      <td>${(g.moves||[]).length}</td>
+      <td style="font-family:var(--font-mono);font-size:12px">${msToDisplay(g.white_time_ms)} / ${msToDisplay(g.black_time_ms)}</td>
+      <td>
+        <button class="btn btn-ghost btn-sm" onclick="selectGame(${g.id})">Wybierz</button>
+      </td>
+    </tr>
+  `).join('');
+}
+
+function selectGame(id) {
+  selectedGameId = id;
+  document.getElementById('game-select').value = id;
+  onGameSelect();
+}
+
+function onGameSelect() {
+  const sel = document.getElementById('game-select');
+  selectedGameId = sel.value ? parseInt(sel.value) : null;
+  const g = games.find(x => x.id == selectedGameId);
+  if (g) {
+    updateClockDisplay(g);
+    document.getElementById('active-game-label').textContent =
+      `#${g.id}: ${g.white_player||'Białe'} vs ${g.black_player||'Czarne'}`;
+    document.getElementById('clock-display').style.display = 'grid';
+  } else {
+    document.getElementById('clock-display').style.display = 'none';
+    document.getElementById('active-game-label').textContent = 'Brak wybranej partii';
+  }
+}
+
+function updateClockDisplay(g) {
+  document.getElementById('w-name').textContent = g.white_player || 'Białe';
+  document.getElementById('b-name').textContent = g.black_player || 'Czarne';
+  const wt = document.getElementById('w-time');
+  const bt = document.getElementById('b-time');
+  wt.textContent = msToDisplay(g.white_time_ms);
+  bt.textContent = msToDisplay(g.black_time_ms);
+  wt.className = 'clock-time' + (g.white_time_ms < 60000 ? ' low' : '');
+  bt.className = 'clock-time' + (g.black_time_ms < 60000 ? ' low' : '');
+  const ongoing = g.status === 'ongoing';
+  document.getElementById('w-active').textContent = ongoing ? (g.turn === 'White' ? 'CHODZI' : '') : g.status;
+  document.getElementById('b-active').textContent = ongoing ? (g.turn === 'Black' ? 'CHODZI' : '') : '';
+  document.getElementById('w-active').className = 'clock-active' + (ongoing && g.turn === 'White' ? ' ticking' : '');
+  document.getElementById('b-active').className = 'clock-active' + (ongoing && g.turn === 'Black' ? ' ticking' : '');
+}
+
+// ─── Arbiter API ─────────────────────────────────────────────────────────────
+function requireGame() {
+  if (!selectedGameId) { alert('Wybierz partię z listy.'); return false; }
+  return true;
+}
+
+async function apiCall(endpoint, body, desc) {
+  if (!requireGame()) return;
+  log(`${desc} → partia #${selectedGameId}...`, 'log-info');
+  try {
+    const r = await fetch(endpoint, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({...body, game_id: selectedGameId})
+    });
+    const data = await r.json();
+    if (r.ok && data.ok) {
+      log(`OK: ${desc}` + (data.winner ? ` — zwycięzca: ${data.winner}` : ''), 'log-ok');
+      await loadGames();
+    } else {
+      log(`Błąd: ${data.error || r.status}`, 'log-err');
+    }
+  } catch(e) {
+    log(`Błąd połączenia: ${e.message}`, 'log-err');
+  }
+}
+
+function arbiterPause() {
+  const reason = document.getElementById('pause-reason').value || 'wstrzymano przez arbitra';
+  apiCall('/arbiter/pause', {reason}, 'Wstrzymanie partii (Art. 6.11.1)');
+}
+function arbiterResume() {
+  const reason = document.getElementById('pause-reason').value || 'wznowiono przez arbitra';
+  apiCall('/arbiter/resume', {reason}, 'Wznowienie partii (Art. 6.11.3)');
+}
+
+function arbiterAdjustClock() {
+  if (!requireGame()) return;
+  const wStr = document.getElementById('adj-white').value.trim();
+  const bStr = document.getElementById('adj-black').value.trim();
+  const reason = document.getElementById('adj-reason').value || 'korekta zegara';
+  const body = {reason};
+  if (wStr) { const ms = parseTime(wStr); if (ms===null){alert('Niepoprawny czas Białych (mm:ss)');return;} body.white_time_ms = ms; }
+  if (bStr) { const ms = parseTime(bStr); if (ms===null){alert('Niepoprawny czas Czarnych (mm:ss)');return;} body.black_time_ms = ms; }
+  if (!body.white_time_ms && !body.black_time_ms) { alert('Podaj przynajmniej jeden czas.'); return; }
+  apiCall('/arbiter/adjust-clock', body, 'Korekta zegara (Art. 6.10.2)');
+}
+
+function arbiterAddTime() {
+  const player = document.getElementById('bonus-player').value;
+  const sec = parseInt(document.getElementById('bonus-sec').value, 10);
+  const reason = document.getElementById('bonus-reason').value || 'bonifikata czasu';
+  if (isNaN(sec) || sec < 1) { alert('Podaj prawidłową liczbę sekund.'); return; }
+  apiCall('/arbiter/add-time', {player, add_ms: sec*1000, reason}, `Bonifikata +${sec}s dla ${player} (Art. 7.5.5)`);
+}
+
+function arbiterSetTimeControl() {
+  if (!requireGame()) return;
+  const tcSec = parseInt(document.getElementById('tc-control').value, 10);
+  const wMs = parseTime(document.getElementById('tc-white').value);
+  const bMs = parseTime(document.getElementById('tc-black').value);
+  if (isNaN(tcSec) || tcSec < 1) { alert('Podaj kontrolę czasu w sekundach.'); return; }
+  const body = {time_control_sec: tcSec};
+  if (wMs !== null) body.white_time_ms = wMs;
+  if (bMs !== null) body.black_time_ms = bMs;
+  apiCall('/arbiter/set-timecontrol', body, 'Nowa kontrola czasu (Art. 6.10.1)');
+}
+
+function arbiterDeleteMove() {
+  const reason = document.getElementById('del-reason').value || 'cofnięcie nielegalnego ruchu';
+  if (!confirm('Cofnąć ostatni ruch? Sędzia musi przywrócić fizyczną pozycję na szachownicy.')) return;
+  apiCall('/arbiter/delete-move', {reason}, 'Cofnięcie ruchu (Art. 7.5.1)');
+}
+
+function arbiterVoid() {
+  const reason = document.getElementById('void-reason').value || 'unieważnienie partii';
+  if (!confirm('UWAGA: Unieważnić całą partię? Wszystkie ruchy zostaną usunięte z bazy.')) return;
+  apiCall('/arbiter/void', {reason}, 'Unieważnienie partii (Art. 7.2.1)');
+}
+
+function arbiterForfeit() {
+  const loser = document.getElementById('forfeit-loser').value;
+  const basis = document.getElementById('forfeit-basis').value;
+  const extra = document.getElementById('forfeit-reason').value;
+  const reason = extra ? `${basis}; ${extra}` : basis;
+  if (!confirm(`Ogłosić przegraną dla ${loser}? Podstawa: ${basis}`)) return;
+  apiCall('/arbiter/forfeit', {loser, reason}, `Przegrana ${loser} (${basis})`);
+}
+
+function arbiterFlagFall() {
+  const loser = document.getElementById('flag-loser').value;
+  if (!confirm(`Ogłosić upływ czasu dla ${loser}? (Art. 6.8)`)) return;
+  apiCall('/arbiter/forfeit', {loser, reason: 'Art. 6.8 — upływ czasu (opadnięcie flagi)'}, `Upływ czasu ${loser} (Art. 6.8)`);
+}
+
+function arbiterDraw() {
+  const reason = document.getElementById('draw-reason').value || 'pozycja martwa — brak możliwości mata';
+  if (!confirm('Ogłosić remis? (Art. 6.9)')) return;
+  apiCall('/arbiter/draw', {reason}, 'Remis arbitra (Art. 6.9)');
+}
+
+function arbiterSwapColors() {
+  if (!requireGame()) return;
+  if (!confirm('Zamienić kolory zawodników? (Art. 7.3 — tylko przed 10. ruchem)')) return;
+  apiCall('/arbiter/set-players', {swap: true}, 'Zamiana kolorów (Art. 7.3)');
+}
+
+function arbiterSetPlayers() {
+  const white = document.getElementById('sp-white').value.trim();
+  const black = document.getElementById('sp-black').value.trim();
+  if (!white && !black) { alert('Podaj przynajmniej jedną nazwę zawodnika.'); return; }
+  apiCall('/arbiter/set-players', {white_player: white, black_player: black, swap: false}, 'Zmiana zawodników');
+}
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+loadGames();
+setInterval(loadGames, 5000);
+</script>
+</body>
+</html>
