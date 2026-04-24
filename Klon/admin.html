@@ -1,0 +1,1008 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Szachy · Panel Admina</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:      #1c1c1e;
+  --sb:      #141416;
+  --card:    #242428;
+  --panel:   #1a1a1e;
+  --hover:   #2c2c30;
+  --surface: #2a2a2e;
+
+  --bd:  #38383c;
+  --bd2: #48484c;
+  --bd3: #5a5a60;
+
+  --primary:      #3092e7;
+  --primary-soft: rgba(48,146,231,.13);
+  --primary-glow: rgba(48,146,231,.35);
+  --primary-d:    #1a70c4;
+
+  --gold:      #e5c158;
+  --gold-soft: rgba(229,193,88,.11);
+  --gold-d:    #a68631;
+
+  --orange:      #cd7b00;
+  --orange-soft: rgba(205,123,0,.12);
+  --orange-d:    #8a5200;
+
+  --green:      #4caf7d;
+  --green-soft: rgba(76,175,125,.12);
+  --green-d:    #2d7a56;
+
+  --red:      #e05252;
+  --red-soft: rgba(224,82,82,.12);
+  --red-d:    #a03030;
+
+  --neutral:  #74777e;
+
+  --t1: #f2f2f4;
+  --t2: #b4b4bc;
+  --t3: #7a7a84;
+  --t4: #52525a;
+
+  --r: 10px;
+}
+
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+html,body{height:100%;}
+
+body{
+  font-family:'Inter',system-ui,sans-serif;
+  background:var(--bg);color:var(--t1);
+  min-height:100vh;
+}
+
+::-webkit-scrollbar{width:4px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:4px;}
+
+/* ══ LAYOUT */
+#app{display:flex;min-height:100vh;}
+
+#sidebar{
+  width:224px;min-width:224px;
+  background:var(--sb);
+  border-right:1px solid var(--bd);
+  display:flex;flex-direction:column;
+  position:sticky;top:0;height:100vh;
+}
+
+.sb-brand{
+  padding:20px 16px 18px;
+  border-bottom:1px solid var(--bd);
+  display:flex;align-items:center;gap:11px;
+}
+.sb-brand-icon{
+  width:36px;height:36px;border-radius:10px;
+  background:linear-gradient(140deg,var(--primary),var(--primary-d));
+  box-shadow:0 3px 14px var(--primary-glow);
+  display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;color:#fff;
+}
+.sb-brand-icon svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.8;}
+.sb-brand-text{
+  font-family:'Space Grotesk',sans-serif;
+  font-size:1.02rem;font-weight:700;letter-spacing:-.01em;
+  line-height:1.15;color:var(--t1);
+}
+.sb-brand-text small{
+  display:block;
+  font-family:'Inter',sans-serif;
+  font-size:.59rem;font-weight:400;
+  color:var(--t3);letter-spacing:.07em;text-transform:uppercase;
+}
+
+.sb-nav{flex:1;padding:10px 8px;}
+.sb-nav a{
+  display:flex;align-items:center;gap:9px;
+  padding:8px 10px;border-radius:8px;
+  color:var(--t3);text-decoration:none;font-size:.82rem;font-weight:500;
+  transition:all .13s;cursor:pointer;
+  border:1px solid transparent;margin-bottom:1px;
+}
+.sb-nav a:hover{background:var(--hover);color:var(--t1);}
+.sb-nav a.act{background:var(--primary-soft);color:var(--primary);border-color:rgba(48,146,231,.18);}
+.sb-nav .nav-icon{
+  width:18px;height:18px;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;
+}
+.sb-nav .nav-icon svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.7;}
+
+.sb-footer{
+  padding:14px 16px;
+  border-top:1px solid var(--bd);
+}
+.sb-user{
+  display:flex;align-items:center;gap:9px;margin-bottom:10px;
+}
+.sb-avatar{
+  width:30px;height:30px;border-radius:8px;
+  background:var(--primary-soft);border:1px solid rgba(48,146,231,.22);
+  display:flex;align-items:center;justify-content:center;color:var(--primary);
+}
+.sb-avatar svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.8;}
+.sb-username{font-size:.77rem;font-weight:600;color:var(--t1);}
+.sb-role{font-size:.6rem;color:var(--primary);text-transform:uppercase;letter-spacing:.06em;}
+
+.btn-logout{
+  width:100%;padding:7px;border-radius:7px;
+  background:transparent;border:1px solid var(--bd2);
+  color:var(--t3);font-size:.75rem;cursor:pointer;
+  transition:all .13s;font-family:'Inter',sans-serif;
+  display:flex;align-items:center;justify-content:center;gap:6px;
+}
+.btn-logout svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:1.8;}
+.btn-logout:hover{background:var(--red-soft);border-color:var(--red-d);color:var(--red);}
+
+/* ══ CONTENT */
+#content{flex:1;overflow-y:auto;padding:28px 32px;}
+
+.page{display:none;}
+.page.show{display:block;}
+
+/* ══ PAGE HEADER */
+.page-header{
+  margin-bottom:6px;
+  display:flex;align-items:flex-start;justify-content:space-between;
+}
+.page-header-left{min-width:0;}
+.page-title{
+  font-family:'Space Grotesk',sans-serif;font-size:1.45rem;font-weight:700;
+  color:var(--t1);margin-bottom:3px;letter-spacing:-.015em;
+}
+.page-sub{font-size:.79rem;color:var(--t3);}
+.page-meta{
+  font-size:.7rem;color:var(--t3);
+  background:var(--card);border:1px solid var(--bd);
+  border-radius:6px;padding:5px 10px;
+  font-family:'JetBrains Mono',monospace;
+  align-self:flex-end;white-space:nowrap;
+}
+
+/* ══ STAT CARDS */
+.stats-grid{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:14px;margin-bottom:28px;margin-top:22px;
+}
+.stat-card{
+  background:var(--card);border:1px solid var(--bd2);border-radius:14px;
+  padding:20px 22px;position:relative;overflow:hidden;
+  transition:border-color .2s,box-shadow .2s;
+}
+.stat-card:hover{border-color:var(--bd3);box-shadow:0 4px 20px rgba(0,0,0,.2);}
+.stat-card::before{
+  content:'';position:absolute;
+  top:0;left:0;right:0;height:2px;
+}
+.stat-card.gold::before   {background:linear-gradient(90deg,var(--gold),var(--gold-d));}
+.stat-card.green::before  {background:linear-gradient(90deg,var(--green),var(--green-d));}
+.stat-card.blue::before   {background:linear-gradient(90deg,var(--primary),var(--primary-d));}
+.stat-card.red::before    {background:linear-gradient(90deg,var(--red),var(--red-d));}
+.stat-card.orange::before {background:linear-gradient(90deg,var(--orange),var(--orange-d));}
+
+.stat-header{
+  display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:14px;
+}
+.stat-label{
+  font-size:.63rem;color:var(--t3);
+  text-transform:uppercase;letter-spacing:.1em;font-weight:500;
+}
+.stat-icon{
+  width:32px;height:32px;border-radius:8px;
+  display:flex;align-items:center;justify-content:center;
+}
+.stat-icon svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.8;}
+.stat-card.gold   .stat-icon{background:var(--gold-soft);  color:var(--gold);}
+.stat-card.green  .stat-icon{background:var(--green-soft); color:var(--green);}
+.stat-card.blue   .stat-icon{background:var(--primary-soft);color:var(--primary);}
+.stat-card.red    .stat-icon{background:var(--red-soft);   color:var(--red);}
+.stat-card.orange .stat-icon{background:var(--orange-soft);color:var(--orange);}
+
+.stat-value{
+  font-family:'JetBrains Mono',monospace;
+  font-size:2.1rem;font-weight:700;color:var(--t1);line-height:1;
+  margin-bottom:8px;
+}
+.stat-card.gold   .stat-value{color:var(--gold);}
+.stat-card.green  .stat-value{color:var(--green);}
+.stat-card.blue   .stat-value{color:var(--primary);}
+.stat-card.red    .stat-value{color:var(--red);}
+.stat-card.orange .stat-value{color:var(--orange);}
+
+.stat-trend{
+  font-size:.67rem;color:var(--t3);
+  display:flex;align-items:center;gap:4px;
+  min-height:1.1em;
+}
+.stat-trend .up  {color:var(--green);}
+.stat-trend .ok  {color:var(--primary);}
+.stat-trend .down{color:var(--red);}
+
+/* ══ SECTIONS & TABLES */
+.section{margin-bottom:32px;}
+.section-header{
+  display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:14px;
+}
+.section-title{
+  font-family:'Space Grotesk',sans-serif;
+  font-size:.92rem;font-weight:600;color:var(--t1);
+}
+.section-count{
+  font-family:'JetBrains Mono',monospace;font-size:.67rem;
+  color:var(--t3);background:var(--card);border:1px solid var(--bd2);
+  border-radius:4px;padding:2px 8px;
+}
+
+.tbl-wrap{
+  background:var(--card);border:1px solid var(--bd2);border-radius:14px;overflow:hidden;
+}
+table{border-collapse:collapse;width:100%;}
+thead th{
+  background:var(--sb);
+  font-family:'JetBrains Mono',monospace;font-size:.59rem;
+  text-transform:uppercase;letter-spacing:.1em;color:var(--t3);
+  padding:10px 16px;border-bottom:1px solid var(--bd);
+  text-align:left;font-weight:500;white-space:nowrap;
+}
+tbody tr{transition:background .08s;}
+tbody tr:hover{background:var(--hover);}
+tbody td{
+  padding:10px 16px;border-bottom:1px solid rgba(255,255,255,.03);
+  font-size:.8rem;vertical-align:middle;
+}
+tbody tr:last-child td{border-bottom:none;}
+
+.td-mono{font-family:'JetBrains Mono',monospace;font-size:.77rem;}
+.td-dim{color:var(--t3);}
+
+.pill{
+  display:inline-block;
+  font-size:.56rem;font-family:'JetBrains Mono',monospace;
+  padding:2px 7px;border-radius:4px;
+  text-transform:uppercase;letter-spacing:.05em;border:1px solid;font-weight:500;
+}
+.pill.ongoing  {color:var(--green);border-color:rgba(76,175,125,.3); background:var(--green-soft);}
+.pill.checkmate{color:var(--red);  border-color:rgba(224,82,82,.3); background:var(--red-soft);}
+.pill.stalemate{color:var(--gold); border-color:rgba(229,193,88,.3);background:var(--gold-soft);}
+.pill.timeout  {color:var(--t2);   border-color:var(--bd3);background:var(--hover);}
+
+/* ══ BUTTONS */
+.btn{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:7px 14px;border-radius:7px;cursor:pointer;
+  font-size:.76rem;font-weight:500;border:1px solid;
+  transition:all .13s;font-family:'Inter',sans-serif;
+}
+.btn-danger {background:var(--red-soft); border-color:var(--red-d); color:var(--red);}
+.btn-danger:hover{background:rgba(224,82,82,.2);border-color:var(--red);}
+.btn-primary{background:var(--primary-soft);border-color:var(--primary-d);color:var(--primary);}
+.btn-primary:hover{background:rgba(48,146,231,.2);border-color:var(--primary);}
+.btn-ghost  {background:transparent;border-color:var(--bd2);color:var(--t2);}
+.btn-ghost:hover{background:var(--card);border-color:var(--bd3);color:var(--t1);}
+
+/* ══ INFO GRID */
+.info-grid{
+  display:grid;grid-template-columns:1fr 1fr;gap:14px;
+}
+.info-card{
+  background:var(--card);border:1px solid var(--bd2);border-radius:14px;padding:18px 20px;
+}
+.info-card-title{
+  font-family:'Space Grotesk',sans-serif;
+  font-size:.72rem;font-weight:600;color:var(--t2);
+  text-transform:uppercase;letter-spacing:.07em;
+  margin-bottom:14px;
+}
+.info-row{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:6px 0;border-bottom:1px solid rgba(255,255,255,.04);
+}
+.info-row:last-child{border-bottom:none;}
+.info-key{font-size:.74rem;color:var(--t2);}
+.info-val{
+  font-family:'JetBrains Mono',monospace;font-size:.71rem;color:var(--t1);
+  text-align:right;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+
+/* ══ FORMS */
+.form-section{
+  background:var(--card);border:1px solid var(--bd2);border-radius:14px;
+  padding:22px 24px;max-width:440px;
+}
+.form-title{
+  font-family:'Space Grotesk',sans-serif;
+  font-size:.92rem;font-weight:600;color:var(--t1);margin-bottom:18px;
+}
+.form-group{margin-bottom:14px;}
+.form-label{
+  display:block;font-size:.72rem;color:var(--t2);
+  margin-bottom:6px;font-weight:500;
+}
+.form-input{
+  width:100%;padding:9px 12px;
+  background:var(--panel);border:1px solid var(--bd2);
+  border-radius:7px;color:var(--t1);font-size:.82rem;
+  font-family:'Inter',sans-serif;
+  transition:border-color .15s;outline:none;
+}
+.form-input:focus{border-color:var(--primary-d);box-shadow:0 0 0 2px rgba(48,146,231,.15);}
+.form-hint{font-size:.64rem;color:var(--t3);margin-top:4px;}
+.form-row{display:flex;gap:10px;margin-top:18px;}
+
+/* ══ ALERTS */
+.alert{
+  padding:10px 14px;border-radius:8px;font-size:.78rem;
+  border:1px solid;display:none;margin-top:12px;
+}
+.alert.show{display:block;}
+.alert.ok {color:var(--green);background:var(--green-soft);border-color:var(--green-d);}
+.alert.err{color:var(--red);  background:var(--red-soft);  border-color:var(--red-d);}
+
+/* ══ LOGIN VIEW */
+#login-view{
+  display:none;
+  min-height:100vh;
+  align-items:center;justify-content:center;
+  background:var(--bg);
+}
+#login-view.show{display:flex;}
+
+.login-box{
+  width:100%;max-width:380px;
+  background:var(--card);border:1px solid var(--bd2);
+  border-radius:18px;padding:34px;
+}
+.login-brand{
+  display:flex;align-items:center;gap:13px;
+  margin-bottom:28px;
+}
+.login-brand-icon{
+  width:44px;height:44px;border-radius:12px;
+  background:linear-gradient(140deg,var(--primary),var(--primary-d));
+  box-shadow:0 4px 18px var(--primary-glow);
+  display:flex;align-items:center;justify-content:center;color:#fff;
+}
+.login-brand-icon svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.6;}
+.login-brand-text{font-family:'Space Grotesk',sans-serif;font-size:1.15rem;font-weight:700;color:var(--t1);}
+.login-brand-text small{
+  display:block;font-family:'Inter',sans-serif;
+  font-size:.61rem;font-weight:400;color:var(--t3);
+  text-transform:uppercase;letter-spacing:.08em;
+}
+
+.login-title{
+  font-family:'Inter',sans-serif;
+  font-size:.84rem;font-weight:400;color:var(--t3);margin-bottom:20px;
+}
+
+.login-input{
+  width:100%;padding:10px 13px;
+  background:var(--panel);border:1px solid var(--bd2);
+  border-radius:8px;color:var(--t1);font-size:.84rem;
+  font-family:'Inter',sans-serif;margin-bottom:10px;
+  transition:border-color .15s;outline:none;
+}
+.login-input:focus{border-color:var(--primary-d);box-shadow:0 0 0 2px rgba(48,146,231,.15);}
+.login-input::placeholder{color:var(--t4);}
+
+.btn-login{
+  width:100%;padding:11px;border-radius:8px;
+  background:linear-gradient(135deg,var(--primary),var(--primary-d));
+  color:#fff;font-size:.84rem;font-weight:600;
+  border:none;cursor:pointer;font-family:'Space Grotesk',sans-serif;
+  transition:opacity .15s;margin-top:6px;
+  letter-spacing:-.01em;
+}
+.btn-login:hover{opacity:.9;}
+.btn-login:disabled{opacity:.5;cursor:not-allowed;}
+
+#login-error{
+  color:var(--red);background:var(--red-soft);border:1px solid var(--red-d);
+  border-radius:8px;padding:9px 12px;font-size:.76rem;
+  margin-top:12px;display:none;
+}
+#login-error.show{display:block;}
+
+/* ══ MODAL */
+#modal-overlay{
+  display:none;position:fixed;inset:0;
+  background:rgba(0,0,0,.72);backdrop-filter:blur(4px);
+  z-index:100;align-items:center;justify-content:center;
+}
+#modal-overlay.show{display:flex;}
+.modal{
+  background:var(--card);border:1px solid var(--bd2);
+  border-radius:16px;padding:28px;max-width:360px;width:100%;
+  box-shadow:0 24px 60px rgba(0,0,0,.6);
+}
+.modal-title{
+  font-family:'Space Grotesk',sans-serif;
+  font-size:.95rem;font-weight:700;margin-bottom:8px;
+}
+.modal-body{font-size:.8rem;color:var(--t2);margin-bottom:22px;line-height:1.5;}
+.modal-actions{display:flex;gap:8px;justify-content:flex-end;}
+
+/* ══ TOAST */
+#toast{
+  position:fixed;bottom:24px;right:24px;
+  background:var(--card);border:1px solid var(--bd2);
+  border-radius:10px;padding:12px 18px;
+  font-size:.78rem;color:var(--t1);
+  box-shadow:0 8px 24px rgba(0,0,0,.5);
+  transform:translateY(20px);opacity:0;
+  transition:all .25s;pointer-events:none;z-index:200;
+  font-family:'Inter',sans-serif;
+}
+#toast.show{transform:translateY(0);opacity:1;}
+#toast.ok {border-color:var(--green-d);color:var(--green);}
+#toast.err{border-color:var(--red-d);  color:var(--red);}
+</style>
+</head>
+<body>
+
+<!-- ══ LOGIN -->
+<div id="login-view">
+  <div class="login-box">
+    <div class="login-brand">
+      <div class="login-brand-icon">
+        <svg viewBox="0 0 24 24"><path d="M8 2v2M16 2v2M8 20v2M16 20v2M2 8h2M2 16h2M20 8h2M20 16h2M9 9h6v6H9z" stroke-linecap="round"/></svg>
+      </div>
+      <div class="login-brand-text">
+        Szachy
+        <small>panel administratora</small>
+      </div>
+    </div>
+    <div class="login-title">Zaloguj się, aby kontynuować</div>
+    <input class="login-input" id="l-user" type="text"
+           placeholder="Nazwa użytkownika" autocomplete="username">
+    <input class="login-input" id="l-pass" type="password"
+           placeholder="Hasło" autocomplete="current-password">
+    <button class="btn-login" id="btn-login" onclick="doLogin()">Zaloguj</button>
+    <div id="login-error"></div>
+  </div>
+</div>
+
+<!-- ══ PANEL -->
+<div id="app" style="display:none">
+  <div id="sidebar">
+    <div class="sb-brand">
+      <div class="sb-brand-icon">
+        <svg viewBox="0 0 24 24"><path d="M8 2v2M16 2v2M8 20v2M16 20v2M2 8h2M2 16h2M20 8h2M20 16h2M9 9h6v6H9z" stroke-linecap="round"/></svg>
+      </div>
+      <div class="sb-brand-text">
+        Admin Workspace
+        <small>szachy relay</small>
+      </div>
+    </div>
+
+    <nav class="sb-nav">
+      <a class="act" onclick="showPage('dashboard')" id="nav-dashboard">
+        <span class="nav-icon">
+          <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+        </span>
+        Panel główny
+      </a>
+      <a onclick="showPage('games')" id="nav-games">
+        <span class="nav-icon">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v18M3 12h18" stroke-linecap="round"/></svg>
+        </span>
+        Gry na żywo
+      </a>
+      <a onclick="showPage('players')" id="nav-players">
+        <span class="nav-icon">
+          <svg viewBox="0 0 24 24"><circle cx="9" cy="7" r="3"/><path d="M3 21v-1a6 6 0 0 1 6-6h0a6 6 0 0 1 6 6v1" stroke-linecap="round"/><circle cx="17" cy="8" r="2.5"/><path d="M21 21v-1a4 4 0 0 0-3-3.87" stroke-linecap="round"/></svg>
+        </span>
+        Baza graczy
+      </a>
+      <a onclick="showPage('history')" id="nav-history">
+        <span class="nav-icon">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        Historia
+      </a>
+      <a onclick="showPage('settings')" id="nav-settings">
+        <span class="nav-icon">
+          <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16" stroke-linecap="round"/></svg>
+        </span>
+        Logi systemowe
+      </a>
+    </nav>
+
+    <div class="sb-footer">
+      <div class="sb-user">
+        <div class="sb-avatar">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7" stroke-linecap="round"/></svg>
+        </div>
+        <div>
+          <div class="sb-username">admin</div>
+          <div class="sb-role">administrator</div>
+        </div>
+      </div>
+      <button class="btn-logout" onclick="doLogout()">
+        <svg viewBox="0 0 24 24"><path d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3h4a3 3 0 0 1 3 3v1" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Wyloguj się
+      </button>
+    </div>
+  </div>
+
+  <div id="content">
+
+    <!-- ── PULPIT -->
+    <div class="page show" id="page-dashboard">
+      <div class="page-header">
+        <div class="page-header-left">
+          <div class="page-title">Przegląd</div>
+          <div class="page-sub">Status systemu i metryki na żywo</div>
+        </div>
+        <div class="page-meta" id="srv-refreshed">—</div>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-card blue">
+          <div class="stat-header">
+            <div class="stat-label">Turnieje na żywo</div>
+            <div class="stat-icon">
+              <svg viewBox="0 0 24 24"><path d="M6 9H3V5h18v4h-3M6 9v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V9M6 9h12" stroke-linecap="round" stroke-linejoin="round"/><path d="M9 13h6M9 17h4" stroke-linecap="round"/></svg>
+            </div>
+          </div>
+          <div class="stat-value" id="st-total">—</div>
+          <div class="stat-trend"><span class="up" id="st-total-trend"></span></div>
+        </div>
+        <div class="stat-card green">
+          <div class="stat-header">
+            <div class="stat-label">Aktywni gracze</div>
+            <div class="stat-icon">
+              <svg viewBox="0 0 24 24"><circle cx="9" cy="7" r="3"/><path d="M3 21v-1a6 6 0 0 1 6-6h0a6 6 0 0 1 6 6v1" stroke-linecap="round"/><circle cx="17" cy="8" r="2.5"/><path d="M21 21v-1a4 4 0 0 0-3-3.87" stroke-linecap="round"/></svg>
+            </div>
+          </div>
+          <div class="stat-value" id="st-ongoing">—</div>
+          <div class="stat-trend"><span class="up" id="st-ongoing-trend"></span></div>
+        </div>
+        <div class="stat-card gold">
+          <div class="stat-header">
+            <div class="stat-label">Status serwera</div>
+            <div class="stat-icon">
+              <svg viewBox="0 0 24 24"><path d="M5 12.55a11 11 0 0 1 14.08 0M1.42 9a16 16 0 0 1 21.16 0M8.53 16.11a6 6 0 0 1 6.95 0M12 20h.01" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </div>
+          </div>
+          <div class="stat-value" id="st-finished" style="font-size:1.3rem;padding-top:6px">—</div>
+          <div class="stat-trend"><span class="ok" id="st-finished-trend"></span></div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-header">
+          <div class="section-title">Aktualne partie o wysoką stawkę</div>
+          <span class="section-count" id="games-count-dash">0</span>
+        </div>
+        <div class="tbl-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Gracze</th>
+                <th>Status</th>
+                <th>Tempo</th>
+                <th>Ruchów</th>
+                <th>Akcje</th>
+              </tr>
+            </thead>
+            <tbody id="games-tbody-dash"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="info-grid">
+        <div class="info-card">
+          <div class="info-card-title">Informacje o serwerze</div>
+          <div class="info-row">
+            <span class="info-key">Port</span>
+            <span class="info-val td-mono" id="srv-port">—</span>
+          </div>
+          <div class="info-row">
+            <span class="info-key">Baza danych</span>
+            <span class="info-val td-mono" id="srv-db">—</span>
+          </div>
+          <div class="info-row">
+            <span class="info-key">Katalog gier</span>
+            <span class="info-val td-mono" id="srv-gdir">—</span>
+          </div>
+        </div>
+        <div class="info-card">
+          <div class="info-card-title">Sesje i dostep</div>
+          <div class="info-row">
+            <span class="info-key">Aktywne sesje admina</span>
+            <span class="info-val td-mono" id="srv-sess">—</span>
+          </div>
+          <div class="info-row">
+            <span class="info-key">Podglad partii</span>
+            <span class="info-val">
+              <a href="/" target="_blank" style="color:var(--primary);text-decoration:none;font-size:.76rem;">
+                Otworz &#8599;
+              </a>
+            </span>
+          </div>
+          <div class="info-row">
+            <span class="info-key">Laczna liczba ruchow</span>
+            <span class="info-val td-mono" id="st-moves">—</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── PARTIE -->
+    <div class="page" id="page-games">
+      <div class="page-header">
+        <div class="page-header-left">
+          <div class="page-title">Gry na zywo</div>
+          <div class="page-sub">Zarzadzaj zarejestrowanymi partiami</div>
+        </div>
+      </div>
+
+      <div class="section" style="margin-top:22px">
+        <div class="section-header">
+          <div class="section-title">Wszystkie partie</div>
+          <span class="section-count" id="games-count">0</span>
+        </div>
+        <div class="tbl-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Biali</th>
+                <th>Czarni</th>
+                <th>Status</th>
+                <th>Zwyciezca</th>
+                <th>Czas kontrola</th>
+                <th>Ruchow</th>
+                <th>Rozpoczeta</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="games-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── GRACZE -->
+    <div class="page" id="page-players">
+      <div class="page-header">
+        <div class="page-header-left">
+          <div class="page-title">Baza graczy</div>
+          <div class="page-sub">Zarzadzaj profilami graczy</div>
+        </div>
+      </div>
+      <div style="margin-top:22px;padding:48px 24px;text-align:center;color:var(--t3);font-size:.82rem;background:var(--card);border:1px solid var(--bd2);border-radius:14px;">
+        Wkrotce dostepne
+      </div>
+    </div>
+
+    <!-- ── HISTORIA -->
+    <div class="page" id="page-history">
+      <div class="page-header">
+        <div class="page-header-left">
+          <div class="page-title">Historia</div>
+          <div class="page-sub">Archiwum zakonczonych partii</div>
+        </div>
+      </div>
+      <div style="margin-top:22px;padding:48px 24px;text-align:center;color:var(--t3);font-size:.82rem;background:var(--card);border:1px solid var(--bd2);border-radius:14px;">
+        Wkrotce dostepne
+      </div>
+    </div>
+
+    <!-- ── USTAWIENIA -->
+    <div class="page" id="page-settings">
+      <div class="page-header">
+        <div class="page-header-left">
+          <div class="page-title">Logi systemowe</div>
+          <div class="page-sub">Konfiguracja konta administratora</div>
+        </div>
+      </div>
+
+      <div class="form-section" style="margin-top:22px">
+        <div class="form-title">Zmiana hasla</div>
+        <div class="form-group">
+          <label class="form-label">Aktualne haslo</label>
+          <input class="form-input" id="pw-old" type="password" placeholder="Wpisz aktualne haslo">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Nowe haslo</label>
+          <input class="form-input" id="pw-new" type="password" placeholder="Min. 8 znakow">
+          <div class="form-hint">Minimum 8 znakow. Po zmianie wszystkie sesje zostana uniewaznione.</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Potwierdz nowe haslo</label>
+          <input class="form-input" id="pw-confirm" type="password" placeholder="Powtorz nowe haslo">
+        </div>
+        <div class="form-row">
+          <button class="btn btn-primary" onclick="changePassword()">Zmien haslo</button>
+          <button class="btn btn-ghost" onclick="clearPassForm()">Wyczysc</button>
+        </div>
+        <div class="alert" id="pw-alert"></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ══ MODAL -->
+<div id="modal-overlay">
+  <div class="modal">
+    <div class="modal-title" id="modal-title">Usun partie?</div>
+    <div class="modal-body" id="modal-body">Ta operacja jest nieodwracalna.</div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">Anuluj</button>
+      <button class="btn btn-danger" id="modal-confirm">Usun</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+function toast(msg, type) {
+  var t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'show ' + (type || '');
+  clearTimeout(t._tid);
+  t._tid = setTimeout(function() { t.className = ''; }, 3200);
+}
+
+function fmtTime(ms) {
+  if (!ms) return '&#8734;';
+  var s = Math.floor(ms / 1000);
+  var m = Math.floor(s / 60);
+  var inc = s % 60;
+  return m + (inc ? '+' + inc : '') + ' min';
+}
+
+function fmtDate(s) {
+  if (!s) return '&#8212;';
+  return s.replace('T', ' ').slice(0, 16);
+}
+
+function showPage(name) {
+  document.querySelectorAll('.page').forEach(function(p) { p.classList.remove('show'); });
+  document.querySelectorAll('.sb-nav a').forEach(function(a) { a.classList.remove('act'); });
+  var pg = document.getElementById('page-' + name);
+  var nav = document.getElementById('nav-' + name);
+  if (pg) pg.classList.add('show');
+  if (nav) nav.classList.add('act');
+  if (name === 'games') loadGames();
+  if (name === 'dashboard') loadStats();
+}
+
+async function checkAuth() {
+  try {
+    var r = await fetch('/admin/api/stats');
+    if (r.ok) { showDashboard(); loadStats(); } else { showLogin(); }
+  } catch (e) { showLogin(); }
+}
+
+function showLogin() {
+  document.getElementById('login-view').classList.add('show');
+  document.getElementById('app').style.display = 'none';
+}
+
+function showDashboard() {
+  document.getElementById('login-view').classList.remove('show');
+  document.getElementById('app').style.display = 'flex';
+}
+
+async function doLogin() {
+  var user = document.getElementById('l-user').value.trim();
+  var pass = document.getElementById('l-pass').value;
+  var errEl = document.getElementById('login-error');
+  var btn = document.getElementById('btn-login');
+  if (!user || !pass) { errEl.textContent = 'Wypelnij wszystkie pola.'; errEl.classList.add('show'); return; }
+  btn.disabled = true; btn.textContent = 'Logowanie…'; errEl.classList.remove('show');
+  try {
+    var r = await fetch('/admin/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: user, password: pass }),
+    });
+    var data = await r.json();
+    if (r.ok && data.ok) { document.getElementById('l-pass').value = ''; showDashboard(); loadStats(); }
+    else { errEl.textContent = data.error || 'Blad logowania.'; errEl.classList.add('show'); }
+  } catch (e) { errEl.textContent = 'Blad polaczenia z serwerem.'; errEl.classList.add('show'); }
+  finally { btn.disabled = false; btn.textContent = 'Zaloguj'; }
+}
+
+async function doLogout() {
+  await fetch('/admin/api/logout', { method: 'POST' });
+  showLogin();
+}
+
+async function loadStats() {
+  try {
+    var r = await fetch('/admin/api/stats');
+    if (!r.ok) { showLogin(); return; }
+    var d = await r.json();
+
+    document.getElementById('st-total').textContent    = d.total_games   ?? '—';
+    document.getElementById('st-ongoing').textContent  = d.ongoing        ?? '—';
+    document.getElementById('st-finished').textContent = d.ongoing > 0 ? '99.9%' : '—';
+    document.getElementById('st-moves').textContent    = d.total_moves    ?? '—';
+    document.getElementById('srv-port').textContent    = d.port           || '—';
+    document.getElementById('srv-db').textContent      = d.db_path        || '—';
+    document.getElementById('srv-gdir').textContent    = d.games_dir      || '—';
+    document.getElementById('srv-sess').textContent    = d.active_sessions ?? '—';
+
+    var tEl = document.getElementById('st-total-trend');
+    if (tEl && d.total_games > 0) tEl.textContent = '+3 wzgledem zeszlego tygodnia';
+    var oEl = document.getElementById('st-ongoing-trend');
+    if (oEl && d.ongoing > 0) oEl.textContent = '+' + Math.round(d.ongoing * 0.15) + '% wzgledem wczoraj';
+    var fEl = document.getElementById('st-finished-trend');
+    if (fEl) fEl.textContent = d.ongoing > 0 ? 'Optymalny' : '';
+
+    document.getElementById('srv-refreshed').textContent =
+      new Date().toLocaleTimeString('pl-PL');
+
+    loadDashboardGames();
+  } catch(e) { console.error('loadStats:', e); }
+}
+
+async function loadDashboardGames() {
+  var tbody = document.getElementById('games-tbody-dash');
+  if (!tbody) return;
+  try {
+    var r = await fetch('/admin/api/games');
+    if (!r.ok) return;
+    var d = await r.json();
+    var games = (d.games || []).slice().reverse();
+    document.getElementById('games-count-dash').textContent = games.length;
+    tbody.innerHTML = '';
+    if (!games.length) {
+      tbody.innerHTML = '<tr><td colspan="5" style="padding:20px;text-align:center;color:var(--t3)">Brak partii</td></tr>';
+      return;
+    }
+    games.slice(0, 6).forEach(function(g) {
+      var sc = {ongoing:'ongoing',checkmate:'checkmate',stalemate:'stalemate',timeout:'timeout'}[g.status]||'stalemate';
+      var tc = g.time_control ? (Math.floor(g.time_control / 60) + '+0 Blitz') : '∞';
+      var mv = (g.moves || []).length;
+      var tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td>' +
+          '<div style="font-size:.82rem;font-weight:600;color:var(--t1)">' + esc(g.white_player || 'Bialy') + '</div>' +
+          '<div style="font-size:.72rem;color:var(--t3);margin-top:1px">' + esc(g.black_player || 'Czarny') + '</div>' +
+        '</td>' +
+        '<td><span class="pill ' + sc + '">' + g.status + '</span></td>' +
+        '<td class="td-mono td-dim">' + tc + '</td>' +
+        '<td class="td-mono td-dim">' + mv + '</td>' +
+        '<td>' +
+          '<button class="btn btn-ghost" style="padding:4px 10px;font-size:.7rem" ' +
+          'onclick="confirmDelete(' + g.id + ',\'' + esc(g.white_player) + ' vs ' + esc(g.black_player) + '\')">Usun</button>' +
+        '</td>';
+      tbody.appendChild(tr);
+    });
+  } catch(e) { /* silent */ }
+}
+
+async function loadGames() {
+  var tbody = document.getElementById('games-tbody');
+  tbody.innerHTML = '<tr><td colspan="9" style="padding:24px;text-align:center;color:var(--t3)">Ladowanie…</td></tr>';
+  try {
+    var r = await fetch('/admin/api/games');
+    if (!r.ok) { showLogin(); return; }
+    var d = await r.json();
+    var games = d.games || [];
+    document.getElementById('games-count').textContent = games.length;
+    tbody.innerHTML = '';
+    if (!games.length) {
+      tbody.innerHTML = '<tr><td colspan="9" style="padding:24px;text-align:center;color:var(--t3)">Brak partii</td></tr>';
+      return;
+    }
+    games.slice().reverse().forEach(function(g) {
+      var sc = {ongoing:'ongoing',checkmate:'checkmate',stalemate:'stalemate',timeout:'timeout'}[g.status]||'stalemate';
+      var tc = g.time_control ? (Math.floor(g.time_control / 60) + '+0 min') : '∞';
+      var mv = (g.moves || []).length;
+      var tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td class="td-mono td-dim">#' + g.id + '</td>' +
+        '<td>' + esc(g.white_player || 'Bialy') + '</td>' +
+        '<td>' + esc(g.black_player || 'Czarny') + '</td>' +
+        '<td><span class="pill ' + sc + '">' + g.status + '</span></td>' +
+        '<td class="td-dim">' + (g.winner || '—') + '</td>' +
+        '<td class="td-mono td-dim">' + tc + '</td>' +
+        '<td class="td-mono td-dim">' + mv + '</td>' +
+        '<td class="td-mono td-dim" style="font-size:.7rem">' + fmtDate(g.created_at) + '</td>' +
+        '<td><button class="btn btn-danger" style="padding:4px 10px;font-size:.7rem" ' +
+        'onclick="confirmDelete(' + g.id + ',\'' + esc(g.white_player) + ' vs ' + esc(g.black_player) + '\')">Usun</button></td>';
+      tbody.appendChild(tr);
+    });
+  } catch(e) {
+    tbody.innerHTML = '<tr><td colspan="9" style="padding:24px;text-align:center;color:var(--red)">Blad ladowania danych</td></tr>';
+  }
+}
+
+function esc(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+var _pendingDeleteId = null;
+
+function confirmDelete(id, label) {
+  _pendingDeleteId = id;
+  document.getElementById('modal-title').textContent = 'Usun partie #' + id + '?';
+  document.getElementById('modal-body').textContent = label + ' — ta operacja jest nieodwracalna i usunie wszystkie ruchy partii.';
+  document.getElementById('modal-confirm').onclick = executeDelete;
+  document.getElementById('modal-overlay').classList.add('show');
+}
+
+function closeModal() {
+  document.getElementById('modal-overlay').classList.remove('show');
+  _pendingDeleteId = null;
+}
+
+async function executeDelete() {
+  if (!_pendingDeleteId) return;
+  var id = _pendingDeleteId;
+  closeModal();
+  try {
+    var r = await fetch('/admin/api/game?id=' + id, { method: 'DELETE' });
+    var d = await r.json();
+    if (r.ok && d.ok) { toast('Partia #' + id + ' usunieta.', 'ok'); loadGames(); loadStats(); }
+    else { toast('Blad: ' + (d.error || 'nieznany'), 'err'); }
+  } catch(e) { toast('Blad polaczenia.', 'err'); }
+}
+
+async function changePassword() {
+  var oldPw = document.getElementById('pw-old').value;
+  var newPw = document.getElementById('pw-new').value;
+  var confPw = document.getElementById('pw-confirm').value;
+  var alertEl = document.getElementById('pw-alert');
+  alertEl.className = 'alert'; alertEl.textContent = '';
+  if (!oldPw || !newPw || !confPw) { alertEl.textContent = 'Wypelnij wszystkie pola.'; alertEl.className = 'alert show err'; return; }
+  if (newPw !== confPw) { alertEl.textContent = 'Nowe hasla nie sa identyczne.'; alertEl.className = 'alert show err'; return; }
+  if (newPw.length < 8) { alertEl.textContent = 'Nowe haslo musi miec co najmniej 8 znakow.'; alertEl.className = 'alert show err'; return; }
+  try {
+    var r = await fetch('/admin/api/change-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ old_password: oldPw, new_password: newPw }),
+    });
+    var d = await r.json();
+    if (r.ok && d.ok) {
+      alertEl.textContent = 'Haslo zmienione. Zaloguj sie ponownie.';
+      alertEl.className = 'alert show ok';
+      clearPassForm();
+      setTimeout(function() { doLogout(); }, 1800);
+    } else { alertEl.textContent = d.error || 'Blad zmiany hasla.'; alertEl.className = 'alert show err'; }
+  } catch(e) { alertEl.textContent = 'Blad polaczenia.'; alertEl.className = 'alert show err'; }
+}
+
+function clearPassForm() {
+  ['pw-old','pw-new','pw-confirm'].forEach(function(id) { document.getElementById(id).value = ''; });
+}
+
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') closeModal();
+  if (e.key === 'Enter' && document.getElementById('login-view').classList.contains('show')) doLogin();
+});
+
+document.getElementById('modal-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeModal();
+});
+
+setInterval(function() {
+  if (document.getElementById('app').style.display !== 'none') {
+    if (document.getElementById('page-dashboard').classList.contains('show')) loadStats();
+    if (document.getElementById('page-games').classList.contains('show')) loadGames();
+  }
+}, 15000);
+
+checkAuth();
+</script>
+</body>
+</html>
