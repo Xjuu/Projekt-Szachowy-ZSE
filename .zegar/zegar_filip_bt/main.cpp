@@ -42,6 +42,51 @@
 
 // chess-library jest zewnętrzna i ma wewnętrzne -Wshadow w konstruktorach
 // (parametry tak samo nazwane jak pola). Uciszamy je tylko dla tego nagłówka.
+// =============================================================================
+//  Chess Clock Pi — Bluetooth <-> Go server middleman
+// =============================================================================
+//  This program runs on a Raspberry Pi (or any Linux box with Bluetooth + SDL2).
+//  It combines the chess clock that used to live in github/src/*.c (ported to
+//  C++), a Bluetooth RFCOMM server that receives moves from a paired phone, an
+//  on-screen QR code shown at startup that tells the phone how to connect, and
+//  the HTTP relay to server.go that was already in the original main.cpp.
+//
+//  Build:   make
+//  Run:     ./chess_pi  [server_ip[:port]]  [bt_channel]  [clock_code]  [api_key]
+//
+//  Auth:  clock_code = CHS-XXXX-XXXX-XXXX  (from `npm run generate`)
+//         api_key    = sk_...               (private key — required for move/newgame)
+//
+//  Bluetooth protocol (plain text, CRLF or LF separated):
+//      HELLO
+//      NEWGAME|WhiteName|BlackName|minutes|increment_seconds
+//      MOVE|<uci>                         legacy form, e.g. MOVE|e2e4
+//      MOVE|<seq>|<uci>                   preferred, e.g. MOVE|17|e7e8q  (dedup by seq)
+//      PAUSE | RESUME | RESET
+//      ARBITER_STOP | ARBITER_RESUME
+//      ERROR|white|black                  records an arbiter-registered error
+//      BONUS|white|black|<ms>             arbiter time bonus
+//      SYNC_REQUEST                       request full state replay after BT reconnect
+//      ACK|<context>                      confirm receipt of GAME_OVER (or other)
+//      QUIT
+//
+//  Replies from Pi to the phone:
+//      OK|<context>               ACK a command
+//      ERR|<reason>               parse / illegal-move error
+//      DUP|<uci>                  duplicate move (already accepted; not an error)
+//      CLOCK|<whiteMs>|<blackMs>|<active>|<state>   periodic clock snapshot
+//      GAME_OVER|<winner>|<reason>          end of game (retransmitted until ACK)
+//      SYNC_BEGIN
+//      SYNC_GAME|<white>|<black>|<minutes>|<increment>
+//      SYNC_CLOCK|<whiteMs>|<blackMs>|<active>|<state>
+//      SYNC_HISTORY|<count>
+//      SYNC_MOVE|<index>|<uci>              … repeated count times
+//      SYNC_END
+// =============================================================================
+
+// chess-library jest zewnętrzna i ma wewnętrzne -Wshadow w konstruktorach
+// (parametry tak samo nazwane jak pola). Uciszamy je tylko dla tego nagłówka.
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wshadow"
 #include "chess-library/include/chess.hpp"
@@ -57,16 +102,20 @@
 #include <bluetooth/rfcomm.h>
 
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <signal.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -83,55 +132,85 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace chess;
 using SteadyClock = std::chrono::steady_clock;
 using Ms          = std::chrono::milliseconds;
 
-// ─── Global configuration (constants) ────────────────────────────────────────
+// ─── Global configuration ────────────────────────────────────────────────────
 
 enum {
     WINDOW_WIDTH      = 1280,
     WINDOW_HEIGHT     = 400,
     START_MINUTES     = 5,
     INCREMENT_SECONDS = 0,
-    FPS               = 30,           // 30 Hz wystarcza dla zegara — mniej obciąża Pi
+    FPS               = 30,
     DEFAULT_BT_CHAN   = 1
 };
 
-// Retransmisja GAME_OVER po Bluetooth, jeśli tablet nie odpowiedział ACK.
-static const int      ACK_TIMEOUT_MS    = 1000;
-static const int      ACK_MAX_RETRIES   = 5;
+static const int ACK_TIMEOUT_MS    = 1000;
+static const int ACK_MAX_RETRIES   = 5;
 
-// Backoff dla wątku HTTP: po nieudanej próbie czekamy coraz dłużej.
-static const int      HTTP_BACKOFF_BASE_MS = 1000;
-static const int      HTTP_BACKOFF_MAX_MS  = 30000;
+static const int HTTP_BACKOFF_BASE_MS = 1000;
+static const int HTTP_BACKOFF_MAX_MS  = 30000;
+static const int HTTP_CONNECT_TIMEOUT_MS = 3000;   // F2: nieblokujący connect z timeoutem
+static const int HTTP_IO_TIMEOUT_MS      = 5000;
 
-// Plik kolejki offline i plik logu — względne ścieżki, aby aplikacja działała
-// bez praw roota. Można je nadpisać w clock.json.
-static const char*    DEFAULT_QUEUE_FILE = "chess-clock-queue.dat";
-static const char*    DEFAULT_LOG_FILE   = "chess-clock.log";
+// F5: limity ochronne
+static const size_t BT_RECV_BUFFER_MAX = 64 * 1024;   // 64 KiB
+static const size_t BT_LINE_MAX        = 4 * 1024;    // 4 KiB jedna linia
+static const size_t BT_QUEUE_MAX       = 1024;        // wiadomości w kolejce wejściowej
+static const size_t BT_SEND_QUEUE_MAX  = 256;         // wiadomości w kolejce wyjściowej
+static const int    BT_PER_FRAME_MAX   = 32;          // ile komend max na klatkę
+static const int    BT_SEND_TIMEOUT_MS = 1500;        // SO_SNDTIMEO klienta
 
-// ─── Logger (errors and diagnostics to file) ────────────────────────────────
+// F2: persist kolejki nie częściej niż co 250 ms (debounce)
+static const int    QUEUE_PERSIST_MIN_INTERVAL_MS = 250;
+
+// F8: watchdog klatki UI
+static const uint32_t FRAME_WATCHDOG_MS = 2000;
+
+static const char* DEFAULT_QUEUE_FILE = "chess-clock-queue.dat";
+static const char* DEFAULT_LOG_FILE   = "chess-clock.log";
+
+// ─── Logger (asynchronicznie, F3) ───────────────────────────────────────────
 //
-// Prosty, wątkowo-bezpieczny logger zapisujący komunikaty z znacznikami czasu.
-// Używany do diagnostyki turniejowej — wszystkie błędy HTTP/BT lądują w pliku.
+// Logger zbiera wiadomości w pamięci i flushuje je w osobnym wątku co ~200 ms
+// (lub przy zamknięciu). LOG_* nigdy nie blokuje wątku wywołującego na SD.
 
 class Logger {
 public:
     static Logger& instance() { static Logger l; return l; }
 
     void open(const std::string& path) {
-        std::lock_guard<std::mutex> g(mu_);
-        if (file_.is_open()) file_.close();
-        file_.open(path, std::ios::app);
-        path_ = path;
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            if (file_.is_open()) file_.close();
+            file_.open(path, std::ios::app);
+            path_ = path;
+        }
+        if (!running_.exchange(true)) {
+            thr_ = std::thread(&Logger::flushLoop, this);
+        }
     }
 
-    void log(const char* level, const std::string& msg, bool flush) {
+    void close() {
+        if (!running_.exchange(false)) return;
+        cv_.notify_all();
+        if (thr_.joinable()) thr_.join();
         std::lock_guard<std::mutex> g(mu_);
-        if (!file_.is_open()) return;
+        if (file_.is_open()) {
+            for (const auto& line : pending_) file_ << line;
+            pending_.clear();
+            file_.flush();
+            file_.close();
+        }
+    }
+
+    void log(const char* level, const std::string& msg) {
+        if (!running_.load()) return;
         auto now  = std::chrono::system_clock::now();
         auto t    = std::chrono::system_clock::to_time_t(now);
         auto ms   = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -140,28 +219,64 @@ public:
         localtime_r(&t, &tm);
         char tbuf[32];
         std::strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &tm);
-        file_ << tbuf << '.' << std::setw(3) << std::setfill('0') << ms.count()
-              << " [" << level << "] " << msg << '\n';
-        // Flush tylko dla błędów/ostrzeżeń. INFO buforowane — szybciej na SD.
-        if (flush) file_.flush();
+        std::ostringstream os;
+        os << tbuf << '.' << std::setw(3) << std::setfill('0') << ms.count()
+           << " [" << level << "] " << msg << '\n';
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            // Limit pamięci dla loggera — gdy ktoś floodu, nie eksplodujemy.
+            if (pending_.size() < 4096) pending_.push_back(os.str());
+        }
+        cv_.notify_one();
     }
 
-    void error(const std::string& m) { log("ERR ", m, true);  }
-    void warn (const std::string& m) { log("WARN", m, true);  }
-    void info (const std::string& m) { log("INFO", m, false); }
+    void error(const std::string& m) { log("ERR ", m); }
+    void warn (const std::string& m) { log("WARN", m); }
+    void info (const std::string& m) { log("INFO", m); }
 
 private:
     Logger() = default;
+    ~Logger() { close(); }
+
+    void flushLoop() {
+        std::vector<std::string> batch;
+        while (running_.load()) {
+            {
+                std::unique_lock<std::mutex> g(mu_);
+                cv_.wait_for(g, std::chrono::milliseconds(200),
+                             [&]{ return !running_.load() || !pending_.empty(); });
+                if (!pending_.empty()) {
+                    batch.swap(pending_);
+                }
+            }
+            // F3-FIX: NIE trzymamy mu_ podczas zapisu na SD! Tylko flush thread
+            // pisze do file_, więc dostęp jest bezpieczny bez blokady. Wcześniej
+            // LOG_* z UI thread czekał na zakończenie file_.flush() (50-200ms na
+            // SD card), powodując mikro-zawieszenia.
+            if (!batch.empty()) {
+                if (file_.is_open()) {
+                    for (const auto& line : batch) file_ << line;
+                    file_.flush();
+                }
+                batch.clear();
+            }
+        }
+    }
+
     std::mutex     mu_;
+    std::condition_variable cv_;
     std::ofstream  file_;
     std::string    path_;
+    std::vector<std::string> pending_;
+    std::atomic<bool> running_{false};
+    std::thread    thr_;
 };
 
 #define LOG_ERR(msg)  Logger::instance().error(msg)
 #define LOG_WARN(msg) Logger::instance().warn(msg)
 #define LOG_INFO(msg) Logger::instance().info(msg)
 
-// ─── Clock domain (ported from github/src/clock.[ch]) ───────────────────────
+// ─── Clock domain ────────────────────────────────────────────────────────────
 
 enum TimeFormat { TIME_FORMAT_MM_SS, TIME_FORMAT_MM_SS_MS };
 
@@ -190,6 +305,9 @@ struct ClockState {
     ActiveSide  active     = ACTIVE_LEFT;
     GameState   state      = STATE_PAUSED;
     uint32_t    move_count = 0;
+    // Powód zakończenia gry — używany do animowanego komunikatu końca gry.
+    // Wartości: "timeout", "errors", "checkmate", "stalemate".
+    std::string finish_reason;
 };
 
 static void format_time(uint32_t ms, char* out, size_t out_len, TimeFormat fmt) {
@@ -197,7 +315,6 @@ static void format_time(uint32_t ms, char* out, size_t out_len, TimeFormat fmt) 
     uint32_t minutes       = total_seconds / 60;
     uint32_t seconds       = total_seconds % 60;
     uint32_t milliseconds  = ms % 1000;
-
     if (fmt == TIME_FORMAT_MM_SS) {
         std::snprintf(out, out_len, "%02u:%02u", minutes, seconds);
     } else {
@@ -209,9 +326,10 @@ static void format_time(uint32_t ms, char* out, size_t out_len, TimeFormat fmt) 
 static void init_clock(ClockState* c, uint32_t start_ms, uint32_t increment_ms) {
     c->left  = PlayerClock{start_ms, increment_ms, start_ms, 0};
     c->right = PlayerClock{start_ms, increment_ms, start_ms, 0};
-    c->active     = ACTIVE_LEFT;
-    c->state      = STATE_PAUSED;
-    c->move_count = 0;
+    c->active        = ACTIVE_LEFT;
+    c->state         = STATE_PAUSED;
+    c->move_count    = 0;
+    c->finish_reason.clear();
 }
 
 static void reset_clock(ClockState* c, uint32_t start_ms, uint32_t increment_ms) {
@@ -229,7 +347,6 @@ static void pause_resume_clock(ClockState* c) {
 static void switch_side(ClockState* c, ActiveSide pressed) {
     if (c->state != STATE_RUNNING) return;
     if (pressed != c->active)      return;
-
     PlayerClock* a = (c->active == ACTIVE_LEFT) ? &c->left : &c->right;
     a->remaining_ms += a->increment_ms;
     c->active = (c->active == ACTIVE_LEFT) ? ACTIVE_RIGHT : ACTIVE_LEFT;
@@ -238,11 +355,14 @@ static void switch_side(ClockState* c, ActiveSide pressed) {
 
 static void update_clock(ClockState* c, uint32_t delta_ms) {
     if (c->state != STATE_RUNNING) return;
+    // F8: zabezpieczenie przed wielkim delta po wybudzeniu/blokadzie.
+    if (delta_ms > 5000) delta_ms = 5000;
     PlayerClock* a = (c->active == ACTIVE_LEFT) ? &c->left : &c->right;
     if (delta_ms >= a->remaining_ms) {
         a->remaining_ms = 0;
         c->state = (c->active == ACTIVE_LEFT) ? STATE_FINISHED_RIGHT_WIN
                                               : STATE_FINISHED_LEFT_WIN;
+        c->finish_reason = "timeout";
         return;
     }
     a->remaining_ms -= delta_ms;
@@ -263,6 +383,7 @@ static void player_error(ClockState* c, ActiveSide who) {
     if (pc->error_count >= 2) {
         c->state = (who == ACTIVE_LEFT) ? STATE_FINISHED_RIGHT_WIN
                                         : STATE_FINISHED_LEFT_WIN;
+        c->finish_reason = "errors";
     }
 }
 
@@ -271,9 +392,94 @@ static void add_bonus_time(ClockState* c, ActiveSide who, uint32_t bonus_ms) {
     pc->remaining_ms += bonus_ms;
 }
 
-// ─── UI resources (ported from github/src/ui.[ch]) ──────────────────────────
+// ─── UI resources ───────────────────────────────────────────────────────────
 
 enum UIMode { UI_MODE_QR, UI_MODE_SETUP, UI_MODE_GAME, UI_MODE_HELP, UI_MODE_ARBITER };
+
+// F4: prosty cache tekstur. Klucz: pointer fonta + tekst + kolor (32-bit).
+struct TextCacheKey {
+    TTF_Font*   font;
+    std::string text;
+    uint32_t    color; // RGBA pakowany
+    bool operator==(const TextCacheKey& o) const {
+        return font == o.font && color == o.color && text == o.text;
+    }
+};
+struct TextCacheKeyHash {
+    size_t operator()(const TextCacheKey& k) const noexcept {
+        size_t h = std::hash<void*>()((void*)k.font);
+        h ^= std::hash<std::string>()(k.text) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::hash<uint32_t>()(k.color)   + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+struct TextCacheEntry {
+    SDL_Texture* tex = nullptr;
+    int w = 0, h = 0;
+    uint32_t last_used_ms = 0;
+};
+
+class TextCache {
+public:
+    void clear() {
+        for (auto& kv : cache_) {
+            if (kv.second.tex) SDL_DestroyTexture(kv.second.tex);
+        }
+        cache_.clear();
+    }
+    SDL_Texture* get(SDL_Renderer* r, TTF_Font* f, const char* text,
+                     SDL_Color col, int* w, int* h) {
+        if (!text || !*text) return nullptr;
+        TextCacheKey key{f, text,
+            ((uint32_t)col.r << 24) | ((uint32_t)col.g << 16) |
+            ((uint32_t)col.b << 8)  |  (uint32_t)col.a};
+        uint32_t now = SDL_GetTicks();
+        auto it = cache_.find(key);
+        if (it != cache_.end()) {
+            it->second.last_used_ms = now;
+            if (w) *w = it->second.w;
+            if (h) *h = it->second.h;
+            return it->second.tex;
+        }
+        SDL_Surface* s = TTF_RenderUTF8_Blended(f, text, col);
+        if (!s) return nullptr;
+        SDL_Texture* t = SDL_CreateTextureFromSurface(r, s);
+        TextCacheEntry e;
+        e.tex = t; e.w = s->w; e.h = s->h; e.last_used_ms = now;
+        SDL_FreeSurface(s);
+        if (!t) return nullptr;
+        if (w) *w = e.w;
+        if (h) *h = e.h;
+        // Limit pamięci cache — eviction LRU.
+        if (cache_.size() >= 512) evictOldest();
+        cache_.emplace(std::move(key), e);
+        return t;
+    }
+private:
+    void evictOldest() {
+        auto oldest = cache_.begin();
+        for (auto it = cache_.begin(); it != cache_.end(); ++it) {
+            if (it->second.last_used_ms < oldest->second.last_used_ms) oldest = it;
+        }
+        if (oldest != cache_.end()) {
+            if (oldest->second.tex) SDL_DestroyTexture(oldest->second.tex);
+            cache_.erase(oldest);
+        }
+    }
+    std::unordered_map<TextCacheKey, TextCacheEntry, TextCacheKeyHash> cache_;
+};
+
+// Animowany komunikat końca gry. Pokazuje się na środku ekranu po zwycięstwie
+// (na czas, błędy, mat) lub remisie. Można go zamknąć przyciskiem X lub ESC.
+// Animacja: scale-in + fade-in (350 ms, ease-out cubic) + delikatne pulsowanie.
+struct WinnerOverlay {
+    bool        visible      = false;
+    bool        dismissed    = false;
+    uint32_t    start_ms     = 0;
+    std::string winner_text;   // np. "BIALY WYGRAL", "REMIS"
+    std::string reason_text;   // np. "Przekroczenie czasu", "2 bledy"
+    GameState   shown_for     = STATE_PAUSED;
+};
 
 struct AppResources {
     SDL_Window*   window       = nullptr;
@@ -293,6 +499,8 @@ struct AppResources {
     int           bt_channel   = DEFAULT_BT_CHAN;
     std::string   bt_status    = "Oczekiwanie na polaczenie Bluetooth...";
     std::string   server_info;
+    TextCache     text_cache;
+    WinnerOverlay overlay;
 };
 
 struct Button {
@@ -315,15 +523,24 @@ static const SDL_Color COLOR_BUTTON_BONUS_HOVER {230, 210, 100, 255};
 static const SDL_Color COLOR_BUTTON_STOP        {150, 150, 150, 255};
 static const SDL_Color COLOR_BUTTON_STOP_HOVER  {180, 180, 180, 255};
 
-static SDL_Texture* render_text_texture(SDL_Renderer* r, TTF_Font* f,
-                                        const char* text, SDL_Color color,
-                                        int* w, int* h) {
-    SDL_Surface* s = TTF_RenderUTF8_Blended(f, text, color);
-    if (!s) return nullptr;
-    SDL_Texture* t = SDL_CreateTextureFromSurface(r, s);
-    if (t) { *w = s->w; *h = s->h; }
-    SDL_FreeSurface(s);
-    return t;
+// F4: render z cache. Caller NIE niszczy texture (cache jest jej właścicielem).
+static void blit_text(SDL_Renderer* r, TextCache& cache, TTF_Font* f,
+                      const char* text, SDL_Color col, int x, int y,
+                      int* out_w = nullptr, int* out_h = nullptr) {
+    if (!text) return;
+    int w = 0, h = 0;
+    SDL_Texture* t = cache.get(r, f, text, col, &w, &h);
+    if (!t) return;
+    SDL_Rect dst{x, y, w, h};
+    SDL_RenderCopy(r, t, nullptr, &dst);
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+}
+
+// Wersja zwracająca rozmiar tekstu bez kopiowania (np. do centrowania).
+static void measure_text(SDL_Renderer* r, TextCache& cache, TTF_Font* f,
+                         const char* text, SDL_Color col, int* w, int* h) {
+    cache.get(r, f, text, col, w, h);
 }
 
 static void draw_filled_rounded_rect(SDL_Renderer* r, SDL_Rect rect,
@@ -345,44 +562,33 @@ static void draw_filled_rounded_rect(SDL_Renderer* r, SDL_Rect rect,
     }
 }
 
-static void draw_button(SDL_Renderer* r, TTF_Font* f, Button* b, bool hover) {
+static void draw_button(SDL_Renderer* r, TextCache& cache, TTF_Font* f, Button* b, bool hover) {
     SDL_Color bg = hover ? COLOR_BUTTON_HOVER : COLOR_BUTTON_NORMAL;
     draw_filled_rounded_rect(r, b->rect, 8, bg);
     int tw = 0, th = 0;
-    SDL_Texture* tx = render_text_texture(r, f, b->label, COLOR_FG, &tw, &th);
-    if (tx) {
-        SDL_Rect dst{b->rect.x + (b->rect.w - tw)/2,
-                     b->rect.y + (b->rect.h - th)/2, tw, th};
-        SDL_RenderCopy(r, tx, nullptr, &dst);
-        SDL_DestroyTexture(tx);
-    }
+    measure_text(r, cache, f, b->label, COLOR_FG, &tw, &th);
+    blit_text(r, cache, f, b->label, COLOR_FG,
+              b->rect.x + (b->rect.w - tw)/2, b->rect.y + (b->rect.h - th)/2);
 }
 
-static void draw_colored_button(SDL_Renderer* r, TTF_Font* f, Button* b,
+static void draw_colored_button(SDL_Renderer* r, TextCache& cache, TTF_Font* f, Button* b,
                                 SDL_Color normal, SDL_Color hover, bool is_hover) {
     SDL_Color bg = is_hover ? hover : normal;
     draw_filled_rounded_rect(r, b->rect, 8, bg);
     int tw = 0, th = 0;
-    SDL_Texture* tx = render_text_texture(r, f, b->label, COLOR_FG, &tw, &th);
-    if (tx) {
-        SDL_Rect dst{b->rect.x + (b->rect.w - tw)/2,
-                     b->rect.y + (b->rect.h - th)/2, tw, th};
-        SDL_RenderCopy(r, tx, nullptr, &dst);
-        SDL_DestroyTexture(tx);
-    }
+    measure_text(r, cache, f, b->label, COLOR_FG, &tw, &th);
+    blit_text(r, cache, f, b->label, COLOR_FG,
+              b->rect.x + (b->rect.w - tw)/2, b->rect.y + (b->rect.h - th)/2);
 }
 
-static void draw_close_button(SDL_Renderer* r, TTF_Font* f) {
+static void draw_close_button(SDL_Renderer* r, TextCache& cache, TTF_Font* f) {
     SDL_Rect close_rect{WINDOW_WIDTH - 55, 10, 45, 45};
     draw_filled_rounded_rect(r, close_rect, 8, COLOR_BUTTON_ERROR);
     int tw = 0, th = 0;
-    SDL_Texture* tx = render_text_texture(r, f, "X", COLOR_FG, &tw, &th);
-    if (tx) {
-        SDL_Rect dst{close_rect.x + (close_rect.w - tw)/2,
-                     close_rect.y + (close_rect.h - th)/2, tw, th};
-        SDL_RenderCopy(r, tx, nullptr, &dst);
-        SDL_DestroyTexture(tx);
-    }
+    measure_text(r, cache, f, "X", COLOR_FG, &tw, &th);
+    blit_text(r, cache, f, "X", COLOR_FG,
+              close_rect.x + (close_rect.w - tw)/2,
+              close_rect.y + (close_rect.h - th)/2);
 }
 
 // ─── QR code rendering ──────────────────────────────────────────────────────
@@ -426,21 +632,14 @@ static SDL_Texture* make_qr_texture(SDL_Renderer* r, const std::string& text,
     return tex;
 }
 
-// ─── Screen drawing ─────────────────────────────────────────────────────────
+// ─── Screen drawing (z TextCache, F4) ───────────────────────────────────────
 
 static void draw_qr_screen(SDL_Renderer* r, AppResources* a) {
     SDL_SetRenderDrawColor(r, COLOR_BG.r, COLOR_BG.g, COLOR_BG.b, COLOR_BG.a);
     SDL_RenderClear(r);
 
-    int tw = 0, th = 0;
-
-    SDL_Texture* title = render_text_texture(r, a->font_medium,
-        "ZESKANUJ ABY POLACZYC", COLOR_ACCENT, &tw, &th);
-    if (title) {
-        SDL_Rect dst{20, 15, tw, th};
-        SDL_RenderCopy(r, title, nullptr, &dst);
-        SDL_DestroyTexture(title);
-    }
+    blit_text(r, a->text_cache, a->font_medium, "ZESKANUJ ABY POLACZYC",
+              COLOR_ACCENT, 20, 15);
 
     if (a->qr_texture) {
         int qr_draw_h = WINDOW_HEIGHT - 70;
@@ -450,100 +649,82 @@ static void draw_qr_screen(SDL_Renderer* r, AppResources* a) {
     }
 
     int text_x = 20 + (WINDOW_HEIGHT - 70) + 40;
-
-    auto draw_line = [&](TTF_Font* font, const std::string& text, int y, SDL_Color c) {
-        SDL_Texture* t = render_text_texture(r, font, text.c_str(), c, &tw, &th);
-        if (t) {
-            SDL_Rect dst{text_x, y, tw, th};
-            SDL_RenderCopy(r, t, nullptr, &dst);
-            SDL_DestroyTexture(t);
-        }
-    };
-
     int y = 70;
-    draw_line(a->font_medium, "Krok 1: Sparuj telefon z tym Pi", y, COLOR_FG); y += 36;
-    draw_line(a->font_small,  "(Ustawienia -> Bluetooth -> chess-clock-pi)", y, COLOR_FG); y += 26;
-    draw_line(a->font_medium, "Krok 2: Otworz 'Serial Bluetooth Terminal'", y, COLOR_FG); y += 36;
-    draw_line(a->font_small,  "lub aplikacje ktora skanuje QR i laczy RFCOMM.", y, COLOR_FG); y += 30;
+    blit_text(r, a->text_cache, a->font_medium,
+              "Krok 1: Sparuj telefon z tym Pi", COLOR_FG, text_x, y); y += 36;
+    blit_text(r, a->text_cache, a->font_small,
+              "(Ustawienia -> Bluetooth -> chess-clock-pi)", COLOR_FG, text_x, y); y += 26;
+    blit_text(r, a->text_cache, a->font_medium,
+              "Krok 2: Otworz 'Serial Bluetooth Terminal'", COLOR_FG, text_x, y); y += 36;
+    blit_text(r, a->text_cache, a->font_small,
+              "lub aplikacje ktora skanuje QR i laczy RFCOMM.", COLOR_FG, text_x, y); y += 30;
 
-    draw_line(a->font_small, ("MAC: " + a->bt_mac).c_str(), y, COLOR_ACCENT); y += 22;
+    blit_text(r, a->text_cache, a->font_small,
+              ("MAC: " + a->bt_mac).c_str(), COLOR_ACCENT, text_x, y); y += 22;
     char chbuf[32]; std::snprintf(chbuf, sizeof(chbuf), "Kanal RFCOMM: %d", a->bt_channel);
-    draw_line(a->font_small, chbuf, y, COLOR_ACCENT); y += 22;
+    blit_text(r, a->text_cache, a->font_small, chbuf, COLOR_ACCENT, text_x, y); y += 22;
     if (!a->server_info.empty()) {
-        draw_line(a->font_small, ("Serwer: " + a->server_info).c_str(), y, COLOR_FG);
-        y += 22;
+        blit_text(r, a->text_cache, a->font_small,
+                  ("Serwer: " + a->server_info).c_str(), COLOR_FG, text_x, y); y += 22;
     }
 
-    draw_line(a->font_small, a->bt_status, WINDOW_HEIGHT - 30,
-              SDL_Color{200, 150, 80, 255});
+    blit_text(r, a->text_cache, a->font_small, a->bt_status.c_str(),
+              SDL_Color{200, 150, 80, 255}, text_x, WINDOW_HEIGHT - 30);
 
-    // Podpowiedź: można pominąć parowanie i wrócić do niego później klawiszem B.
-    {
-        int htw = 0, hth = 0;
-        SDL_Texture* hint = render_text_texture(a->renderer, a->font_small,
-            "ESC / X = pomin parowanie  |  pozniej: B = wroc tutaj",
-            SDL_Color{150, 150, 150, 255}, &htw, &hth);
-        if (hint) {
-            SDL_Rect d{ WINDOW_WIDTH - htw - 20, WINDOW_HEIGHT - 30, htw, hth };
-            SDL_RenderCopy(a->renderer, hint, nullptr, &d);
-            SDL_DestroyTexture(hint);
-        }
-    }
+    int htw = 0, hth = 0;
+    const char* hint = "ESC / X = pomin parowanie  |  pozniej: B = wroc tutaj";
+    measure_text(r, a->text_cache, a->font_small, hint,
+                 SDL_Color{150,150,150,255}, &htw, &hth);
+    blit_text(r, a->text_cache, a->font_small, hint,
+              SDL_Color{150,150,150,255},
+              WINDOW_WIDTH - htw - 20, WINDOW_HEIGHT - 30);
 
-    draw_close_button(r, a->font_small);
-    SDL_RenderPresent(r);
+    draw_close_button(r, a->text_cache, a->font_small);
+    /* RenderPresent przeniesiony do ui_render_frame */
 }
 
 static void draw_setup_screen(SDL_Renderer* r, AppResources* a) {
     SDL_SetRenderDrawColor(r, COLOR_BG.r, COLOR_BG.g, COLOR_BG.b, COLOR_BG.a);
     SDL_RenderClear(r);
-    int tw = 0, th = 0;
 
-    draw_close_button(r, a->font_small);
+    draw_close_button(r, a->text_cache, a->font_small);
 
-    SDL_Texture* title = render_text_texture(r, a->font_medium,
-        "ZEGAR SZACHOWY", COLOR_ACCENT, &tw, &th);
-    SDL_Rect tr{10, 10, tw, th};
-    SDL_RenderCopy(r, title, nullptr, &tr);
-    SDL_DestroyTexture(title);
+    blit_text(r, a->text_cache, a->font_medium, "ZEGAR SZACHOWY",
+              COLOR_ACCENT, 10, 10);
 
     char buf[32];
     std::snprintf(buf, sizeof(buf), "Czas: %um", a->setup_minutes);
-    SDL_Texture* mt = render_text_texture(r, a->font_small, buf, COLOR_FG, &tw, &th);
-    SDL_Rect ml{340, 30, tw, th}; SDL_RenderCopy(r, mt, nullptr, &ml);
-    SDL_DestroyTexture(mt);
+    blit_text(r, a->text_cache, a->font_small, buf, COLOR_FG, 340, 30);
 
     Button minus_time{{330, 60, 40, 35}, "-", false};
     Button plus_time {{440, 60, 40, 35}, "+", false};
-    draw_button(r, a->font_small, &minus_time, false);
-    draw_button(r, a->font_small, &plus_time,  false);
+    draw_button(r, a->text_cache, a->font_small, &minus_time, false);
+    draw_button(r, a->text_cache, a->font_small, &plus_time,  false);
 
     std::snprintf(buf, sizeof(buf), "Inc: %us", a->setup_increment);
-    SDL_Texture* it = render_text_texture(r, a->font_small, buf, COLOR_FG, &tw, &th);
-    SDL_Rect il{810, 30, tw, th}; SDL_RenderCopy(r, it, nullptr, &il);
-    SDL_DestroyTexture(it);
+    blit_text(r, a->text_cache, a->font_small, buf, COLOR_FG, 810, 30);
 
     Button minus_inc{{810, 60, 40, 35}, "-", false};
     Button plus_inc {{920, 60, 40, 35}, "+", false};
-    draw_button(r, a->font_small, &minus_inc, false);
-    draw_button(r, a->font_small, &plus_inc,  false);
+    draw_button(r, a->text_cache, a->font_small, &minus_inc, false);
+    draw_button(r, a->text_cache, a->font_small, &plus_inc,  false);
 
     Button start_btn{{340, 130, 300, 70}, "ROZP. GRE", false};
-    draw_button(r, a->font_medium, &start_btn, false);
+    draw_button(r, a->text_cache, a->font_medium, &start_btn, false);
 
-    SDL_Texture* help = render_text_texture(r, a->font_small,
-        "Kliknij +/- aby ustawic, potem START  (telefon moze wyslac NEWGAME)",
-        SDL_Color{150,150,150,255}, &tw, &th);
-    if (help) {
-        SDL_Rect dst{(WINDOW_WIDTH - tw)/2, WINDOW_HEIGHT - 45, tw, th};
-        SDL_RenderCopy(r, help, nullptr, &dst);
-        SDL_DestroyTexture(help);
-    }
+    int tw = 0, th = 0;
+    const char* hh = "Kliknij +/- aby ustawic, potem START  (telefon moze wyslac NEWGAME)";
+    measure_text(r, a->text_cache, a->font_small, hh,
+                 SDL_Color{150,150,150,255}, &tw, &th);
+    blit_text(r, a->text_cache, a->font_small, hh,
+              SDL_Color{150,150,150,255},
+              (WINDOW_WIDTH - tw)/2, WINDOW_HEIGHT - 45);
 
-    SDL_RenderPresent(r);
+    /* RenderPresent przeniesiony do ui_render_frame */
 }
 
-static void draw_time_display(SDL_Renderer* r, TTF_Font* time_font, TTF_Font* lbl_font,
+static void draw_time_display(SDL_Renderer* r, TextCache& cache,
+                              TTF_Font* time_font, TTF_Font* lbl_font,
                               const char* label, uint32_t ms, SDL_Rect rect,
                               bool active, bool winner) {
     SDL_Color bg = winner ? COLOR_ACCENT : (active ? COLOR_ACTIVE : COLOR_INACTIVE);
@@ -553,21 +734,17 @@ static void draw_time_display(SDL_Renderer* r, TTF_Font* time_font, TTF_Font* lb
     format_time(ms, tbuf, sizeof(tbuf), TIME_FORMAT_MM_SS_MS);
 
     int tw = 0, th = 0;
-    SDL_Texture* tx = render_text_texture(r, time_font, tbuf, COLOR_FG, &tw, &th);
-    if (tx) {
-        SDL_Rect dst{rect.x + (rect.w - tw)/2, rect.y + 40, tw, th};
-        SDL_RenderCopy(r, tx, nullptr, &dst);
-        SDL_DestroyTexture(tx);
-    }
-    SDL_Texture* lbl = render_text_texture(r, lbl_font, label, COLOR_FG, &tw, &th);
-    if (lbl) {
-        SDL_Rect dst{rect.x + (rect.w - tw)/2, rect.y + 10, tw, th};
-        SDL_RenderCopy(r, lbl, nullptr, &dst);
-        SDL_DestroyTexture(lbl);
-    }
+    measure_text(r, cache, time_font, tbuf, COLOR_FG, &tw, &th);
+    blit_text(r, cache, time_font, tbuf, COLOR_FG,
+              rect.x + (rect.w - tw)/2, rect.y + 40);
+
+    measure_text(r, cache, lbl_font, label, COLOR_FG, &tw, &th);
+    blit_text(r, cache, lbl_font, label, COLOR_FG,
+              rect.x + (rect.w - tw)/2, rect.y + 10);
 }
 
-static void draw_status_bar(SDL_Renderer* r, TTF_Font* f, const ClockState* c) {
+static void draw_status_bar(SDL_Renderer* r, TextCache& cache, TTF_Font* f,
+                            const ClockState* c) {
     const char* txt = "";
     SDL_Color col = COLOR_FG;
     switch (c->state) {
@@ -580,28 +757,22 @@ static void draw_status_bar(SDL_Renderer* r, TTF_Font* f, const ClockState* c) {
         default: break;
     }
     int tw = 0, th = 0;
-    SDL_Texture* t = render_text_texture(r, f, txt, col, &tw, &th);
-    if (t) {
-        SDL_Rect d{(WINDOW_WIDTH - tw)/2, 30, tw, th};
-        SDL_RenderCopy(r, t, nullptr, &d);
-        SDL_DestroyTexture(t);
+    if (txt && *txt) {
+        measure_text(r, cache, f, txt, col, &tw, &th);
+        blit_text(r, cache, f, txt, col, (WINDOW_WIDTH - tw)/2, 30);
     }
     char info[64];
     std::snprintf(info, sizeof(info), "Ruch: %u | B:%u | C:%u",
                   c->move_count, c->left.error_count, c->right.error_count);
-    SDL_Texture* it = render_text_texture(r, f, info, COLOR_FG, &tw, &th);
-    if (it) {
-        SDL_Rect d{WINDOW_WIDTH - 250, 35, tw, th};
-        SDL_RenderCopy(r, it, nullptr, &d);
-        SDL_DestroyTexture(it);
-    }
+    measure_text(r, cache, f, info, COLOR_FG, &tw, &th);
+    blit_text(r, cache, f, info, COLOR_FG, WINDOW_WIDTH - 250, 35);
 }
 
 static void draw_game_screen(SDL_Renderer* r, AppResources* a, const ClockState* c) {
     SDL_SetRenderDrawColor(r, COLOR_BG.r, COLOR_BG.g, COLOR_BG.b, COLOR_BG.a);
     SDL_RenderClear(r);
 
-    draw_status_bar(r, a->font_small, c);
+    draw_status_bar(r, a->text_cache, a->font_small, c);
 
     SDL_Rect left_rect {20,  80, 600, 220};
     SDL_Rect right_rect{660, 80, 600, 220};
@@ -610,131 +781,91 @@ static void draw_game_screen(SDL_Renderer* r, AppResources* a, const ClockState*
     bool left_active  = c->active == ACTIVE_LEFT  && c->state == STATE_RUNNING;
     bool right_active = c->active == ACTIVE_RIGHT && c->state == STATE_RUNNING;
 
-    draw_time_display(r, a->font_xlarge, a->font_small, "BIALY",
+    draw_time_display(r, a->text_cache, a->font_xlarge, a->font_small, "BIALY",
                       c->left.remaining_ms,  left_rect,  left_active,  left_winner);
-    draw_time_display(r, a->font_xlarge, a->font_small, "CZARNY",
+    draw_time_display(r, a->text_cache, a->font_xlarge, a->font_small, "CZARNY",
                       c->right.remaining_ms, right_rect, right_active, right_winner);
 
     Button pause_btn {{ 50, 325, 120, 60},
                       (c->state == STATE_PAUSED) ? "WZNOW" : "PAUZA", false};
     Button reset_btn {{200, 325, 100, 60}, "RESET", false};
     Button arbiter_btn{{350, 325, 150, 60}, "ARBITER", false};
-    draw_button(r, a->font_medium, &pause_btn,   false);
-    draw_button(r, a->font_medium, &reset_btn,   false);
-    draw_button(r, a->font_medium, &arbiter_btn, false);
+    draw_button(r, a->text_cache, a->font_medium, &pause_btn,   false);
+    draw_button(r, a->text_cache, a->font_medium, &reset_btn,   false);
+    draw_button(r, a->text_cache, a->font_medium, &arbiter_btn, false);
 
-    // Wyraźny komunikat na środku ekranu, gdy gra jest spauzowana lub
-    // zatrzymana przez arbitra. Bez tego użytkownik może mieć wrażenie,
-    // że aplikacja się zacięła.
     if (c->state == STATE_PAUSED || c->state == STATE_STOPPED_BY_ARBITER) {
         const char* big = (c->state == STATE_PAUSED) ? "PAUZA" : "STOP";
         const char* hint = (c->state == STATE_PAUSED)
             ? "Klik zegara lub WZNOW = start"
             : "Tylko arbiter moze wznowic (Q)";
         int tw = 0, th = 0;
-        SDL_Texture* bt2 = render_text_texture(r, a->font_xlarge, big,
-                                              SDL_Color{255, 200, 0, 255}, &tw, &th);
-        if (bt2) {
-            SDL_Rect dst{(WINDOW_WIDTH - tw) / 2, 100, tw, th};
-            SDL_RenderCopy(r, bt2, nullptr, &dst);
-            SDL_DestroyTexture(bt2);
-        }
-        SDL_Texture* ht = render_text_texture(r, a->font_small, hint,
-                                              SDL_Color{220, 220, 220, 255}, &tw, &th);
-        if (ht) {
-            SDL_Rect dst{(WINDOW_WIDTH - tw) / 2, 200, tw, th};
-            SDL_RenderCopy(r, ht, nullptr, &dst);
-            SDL_DestroyTexture(ht);
-        }
+        measure_text(r, a->text_cache, a->font_xlarge, big,
+                     SDL_Color{255,200,0,255}, &tw, &th);
+        blit_text(r, a->text_cache, a->font_xlarge, big,
+                  SDL_Color{255,200,0,255}, (WINDOW_WIDTH - tw)/2, 100);
+        measure_text(r, a->text_cache, a->font_small, hint,
+                     SDL_Color{220,220,220,255}, &tw, &th);
+        blit_text(r, a->text_cache, a->font_small, hint,
+                  SDL_Color{220,220,220,255}, (WINDOW_WIDTH - tw)/2, 200);
     }
 
-    draw_close_button(r, a->font_small);
+    draw_close_button(r, a->text_cache, a->font_small);
 
     SDL_SetRenderDrawColor(r, COLOR_ACCENT.r, COLOR_ACCENT.g, COLOR_ACCENT.b, COLOR_ACCENT.a);
     SDL_Rect help_box{1230, 365, 50, 35};
     SDL_RenderFillRect(r, &help_box);
     int tw = 0, th = 0;
-    SDL_Texture* h = render_text_texture(r, a->font_small, "?", COLOR_BG, &tw, &th);
-    if (h) {
-        SDL_Rect d{1230 + (50 - tw)/2, 365 + (35 - th)/2, tw, th};
-        SDL_RenderCopy(r, h, nullptr, &d);
-        SDL_DestroyTexture(h);
-    }
+    measure_text(r, a->text_cache, a->font_small, "?", COLOR_BG, &tw, &th);
+    blit_text(r, a->text_cache, a->font_small, "?", COLOR_BG,
+              1230 + (50 - tw)/2, 365 + (35 - th)/2);
 
-    SDL_RenderPresent(r);
+    /* RenderPresent przeniesiony do ui_render_frame */
 }
 
 static void draw_help_screen(SDL_Renderer* r, AppResources* a) {
     SDL_SetRenderDrawColor(r, COLOR_BG.r, COLOR_BG.g, COLOR_BG.b, COLOR_BG.a);
     SDL_RenderClear(r);
-    int tw = 0, th = 0;
+    draw_close_button(r, a->text_cache, a->font_small);
 
-    draw_close_button(r, a->font_small);
-
-    SDL_Texture* t = render_text_texture(r, a->font_medium, "POMOC", COLOR_ACCENT, &tw, &th);
-    SDL_Rect tr{20, 10, tw, th}; SDL_RenderCopy(r, t, nullptr, &tr);
-    SDL_DestroyTexture(t);
-
-    SDL_Texture* h1 = render_text_texture(r, a->font_small, "Gracze:", COLOR_ACCENT, &tw, &th);
-    SDL_Rect r1{20, 60, tw, th}; SDL_RenderCopy(r, h1, nullptr, &r1);
-    SDL_DestroyTexture(h1);
+    blit_text(r, a->text_cache, a->font_medium, "POMOC", COLOR_ACCENT, 20, 10);
+    blit_text(r, a->text_cache, a->font_small, "Gracze:", COLOR_ACCENT, 20, 60);
 
     const char* pl[] = {
-        "Lewa polowa: BIALY",
-        "Prawa polowa: CZARNY",
-        "Klik zegara w pauzie: WZNOW",
-        "SPACJA: Pauza/Wznow",
-        "R: Reset",
-        "B: Parowanie BT",
-        "H/ESC: Menu",
-        "Ctrl+Q: Wyjscie awaryjne"
+        "Lewa polowa: BIALY", "Prawa polowa: CZARNY",
+        "Klik zegara w pauzie: WZNOW", "SPACJA: Pauza/Wznow",
+        "R: Reset", "B: Parowanie BT",
+        "H/ESC: Menu", "Ctrl+Q: Wyjscie awaryjne"
     };
     int y = 85;
     for (int i = 0; i < 8; i++) {
-        SDL_Texture* ln = render_text_texture(r, a->font_small, pl[i], COLOR_FG, &tw, &th);
-        if (ln) { SDL_Rect d{30, y, tw, th}; SDL_RenderCopy(r, ln, nullptr, &d);
-                  SDL_DestroyTexture(ln); }
+        blit_text(r, a->text_cache, a->font_small, pl[i], COLOR_FG, 30, y);
         y += 25;
     }
 
-    SDL_Texture* h2 = render_text_texture(r, a->font_small, "Arbitra:", COLOR_ACCENT, &tw, &th);
-    SDL_Rect r2{650, 60, tw, th}; SDL_RenderCopy(r, h2, nullptr, &r2);
-    SDL_DestroyTexture(h2);
-
-    const char* al[] = {
-        "A: Stop/Q: Wznow",
-        "1/2: Blad B/C",
-        "3/4: +2min B/C"
-    };
+    blit_text(r, a->text_cache, a->font_small, "Arbitra:", COLOR_ACCENT, 650, 60);
+    const char* al[] = { "A: Stop/Q: Wznow", "1/2: Blad B/C", "3/4: +2min B/C" };
     y = 85;
     for (int i = 0; i < 3; i++) {
-        SDL_Texture* ln = render_text_texture(r, a->font_small, al[i], COLOR_FG, &tw, &th);
-        if (ln) { SDL_Rect d{660, y, tw, th}; SDL_RenderCopy(r, ln, nullptr, &d);
-                  SDL_DestroyTexture(ln); }
+        blit_text(r, a->text_cache, a->font_small, al[i], COLOR_FG, 660, y);
         y += 25;
     }
 
-    SDL_Texture* f = render_text_texture(r, a->font_small, "ESC: Powrot do gry",
-                                          SDL_Color{150,150,150,255}, &tw, &th);
-    if (f) {
-        SDL_Rect d{(WINDOW_WIDTH - tw)/2, WINDOW_HEIGHT - 40, tw, th};
-        SDL_RenderCopy(r, f, nullptr, &d);
-        SDL_DestroyTexture(f);
-    }
-    SDL_RenderPresent(r);
+    int tw = 0, th = 0;
+    const char* fl = "ESC: Powrot do gry";
+    measure_text(r, a->text_cache, a->font_small, fl,
+                 SDL_Color{150,150,150,255}, &tw, &th);
+    blit_text(r, a->text_cache, a->font_small, fl,
+              SDL_Color{150,150,150,255},
+              (WINDOW_WIDTH - tw)/2, WINDOW_HEIGHT - 40);
+    /* RenderPresent przeniesiony do ui_render_frame */
 }
 
 static void draw_arbiter_menu(SDL_Renderer* r, AppResources* a, const ClockState* c) {
     SDL_SetRenderDrawColor(r, COLOR_BG.r, COLOR_BG.g, COLOR_BG.b, COLOR_BG.a);
     SDL_RenderClear(r);
-    int tw = 0, th = 0;
-
-    draw_close_button(r, a->font_small);
-
-    SDL_Texture* title = render_text_texture(r, a->font_medium, "MENU ARBITRA",
-                                             COLOR_ACCENT, &tw, &th);
-    SDL_Rect tr{20, 20, tw, th}; SDL_RenderCopy(r, title, nullptr, &tr);
-    SDL_DestroyTexture(title);
+    draw_close_button(r, a->text_cache, a->font_small);
+    blit_text(r, a->text_cache, a->font_medium, "MENU ARBITRA", COLOR_ACCENT, 20, 20);
 
     const char* stop_label = (c->state == STATE_STOPPED_BY_ARBITER) ? "WZNOW" : "STOP";
     Button stop_btn   {{ 80,  90, 220, 65}, stop_label,    false};
@@ -744,21 +875,19 @@ static void draw_arbiter_menu(SDL_Renderer* r, AppResources* a, const ClockState
     Button bonus_b    {{350, 175, 220, 65}, "+2MIN CZARNY",false};
     Button close_btn  {{620, 175, 220, 65}, "ZAMKNIJ",     false};
 
-    draw_colored_button(r, a->font_small, &stop_btn,  COLOR_BUTTON_NORMAL,      COLOR_BUTTON_HOVER,       false);
-    draw_colored_button(r, a->font_small, &error_w,   COLOR_BUTTON_ERROR,       COLOR_BUTTON_ERROR_HOVER, false);
-    draw_colored_button(r, a->font_small, &error_b,   COLOR_BUTTON_ERROR,       COLOR_BUTTON_ERROR_HOVER, false);
-    draw_colored_button(r, a->font_small, &bonus_w,   COLOR_BUTTON_BONUS,       COLOR_BUTTON_BONUS_HOVER, false);
-    draw_colored_button(r, a->font_small, &bonus_b,   COLOR_BUTTON_BONUS,       COLOR_BUTTON_BONUS_HOVER, false);
-    draw_colored_button(r, a->font_small, &close_btn, COLOR_BUTTON_STOP,        COLOR_BUTTON_STOP_HOVER,  false);
+    draw_colored_button(r, a->text_cache, a->font_small, &stop_btn,  COLOR_BUTTON_NORMAL,      COLOR_BUTTON_HOVER,       false);
+    draw_colored_button(r, a->text_cache, a->font_small, &error_w,   COLOR_BUTTON_ERROR,       COLOR_BUTTON_ERROR_HOVER, false);
+    draw_colored_button(r, a->text_cache, a->font_small, &error_b,   COLOR_BUTTON_ERROR,       COLOR_BUTTON_ERROR_HOVER, false);
+    draw_colored_button(r, a->text_cache, a->font_small, &bonus_w,   COLOR_BUTTON_BONUS,       COLOR_BUTTON_BONUS_HOVER, false);
+    draw_colored_button(r, a->text_cache, a->font_small, &bonus_b,   COLOR_BUTTON_BONUS,       COLOR_BUTTON_BONUS_HOVER, false);
+    draw_colored_button(r, a->text_cache, a->font_small, &close_btn, COLOR_BUTTON_STOP,        COLOR_BUTTON_STOP_HOVER,  false);
 
     char info[64];
     std::snprintf(info, sizeof(info), "B: %u bledy | C: %u bledy",
                   c->left.error_count, c->right.error_count);
-    SDL_Texture* it = render_text_texture(r, a->font_small, info, COLOR_FG, &tw, &th);
-    if (it) { SDL_Rect d{20, 270, tw, th}; SDL_RenderCopy(r, it, nullptr, &d);
-              SDL_DestroyTexture(it); }
+    blit_text(r, a->text_cache, a->font_small, info, COLOR_FG, 20, 270);
 
-    SDL_RenderPresent(r);
+    /* RenderPresent przeniesiony do ui_render_frame */
 }
 
 // ─── UI init / cleanup ──────────────────────────────────────────────────────
@@ -782,9 +911,19 @@ static bool create_window_and_renderer(AppResources* a) {
                                  WINDOW_WIDTH, WINDOW_HEIGHT,
                                  SDL_WINDOW_FULLSCREEN_DESKTOP);
     if (!a->window) { std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return false; }
-    a->renderer = SDL_CreateRenderer(a->window, -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    // F10: NIE używamy VSYNC. Na Pi (zwłaszcza KMSDRM/X11 + Mesa) zdarza się,
+    // że SDL_RenderPresent z VSYNC blokuje na vblank, który nigdy nie nadchodzi
+    // (kompozytor zatkany, GPU zatrzymany, brak focus). Manualne SDL_Delay daje
+    // 30 FPS i nie ma żadnej blokującej operacji w renderze.
+    SDL_SetHint(SDL_HINT_RENDER_VSYNC, "0");
+    a->renderer = SDL_CreateRenderer(a->window, -1, SDL_RENDERER_ACCELERATED);
+    if (!a->renderer) {
+        // Fallback: software renderer (jeszcze raz, gdyby ACCEL z jakiegoś
+        // powodu nie wstał — wtedy w ogóle nic byśmy nie wyrenderowali).
+        a->renderer = SDL_CreateRenderer(a->window, -1, SDL_RENDERER_SOFTWARE);
+    }
     if (!a->renderer) { std::fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError()); return false; }
+    SDL_SetRenderDrawBlendMode(a->renderer, SDL_BLENDMODE_BLEND);
     return true;
 }
 
@@ -802,6 +941,7 @@ static bool load_fonts(AppResources* a) {
 }
 
 static void ui_cleanup(AppResources* a) {
+    a->text_cache.clear();
     if (a->qr_texture)  SDL_DestroyTexture(a->qr_texture);
     if (a->font_xlarge) TTF_CloseFont(a->font_xlarge);
     if (a->font_large)  TTF_CloseFont(a->font_large);
@@ -822,22 +962,18 @@ static bool ui_init(AppResources* a) {
     return true;
 }
 
-// ─── Forward declaration: arbiter→serwer ────────────────────────────────────
-//
-// Funkcje zdefiniowane są dalej (po klasie ApiClient), ale event handlery niżej
-// muszą znać ich sygnaturę, żeby raportować akcje arbitra na serwer (poprawka 4).
+// ─── Forward declarations ───────────────────────────────────────────────────
 
-class ApiClient; // pełna definicja niżej
+class ApiClient;
 static void reportArbiter(ApiClient* api, const std::string& action, long long valueMs);
 
-// ─── Event handling (mouse + keyboard) ──────────────────────────────────────
+// ─── Event handling ─────────────────────────────────────────────────────────
 
 static void handle_setup_events(ClockState* c, AppResources* a,
                                 const SDL_Event* e, bool* running) {
     if (e->type == SDL_QUIT) { *running = false; return; }
     if (e->type == SDL_KEYDOWN) {
         if (e->key.keysym.sym == SDLK_ESCAPE) *running = false;
-        // B = powrót do ekranu parowania Bluetooth (QR).
         else if (e->key.keysym.sym == SDLK_b) a->mode = UI_MODE_QR;
         return;
     }
@@ -859,8 +995,6 @@ static void handle_setup_events(ClockState* c, AppResources* a,
     }
 }
 
-// W event handlerach gry/arbitra przyjmujemy ApiClient* aby raportować
-// pauzę/wznowienie/bonus na serwer. Może być nullptr (gdy brak sieci).
 static void handle_game_events(ClockState* c, AppResources* a, ApiClient* api,
                                const SDL_Event* e, bool* running) {
     if (e->type == SDL_QUIT) { *running = false; return; }
@@ -885,16 +1019,8 @@ static void handle_game_events(ClockState* c, AppResources* a, ApiClient* api,
                 reportArbiter(api, "reset", 0);
                 return;
             }
-            case SDLK_a: {
-                stop_by_arbiter(c);
-                reportArbiter(api, "arbiter_stop", 0);
-                return;
-            }
-            case SDLK_q: {
-                resume_by_arbiter(c);
-                reportArbiter(api, "arbiter_resume", 0);
-                return;
-            }
+            case SDLK_a: { stop_by_arbiter(c);   reportArbiter(api, "arbiter_stop", 0); return; }
+            case SDLK_q: { resume_by_arbiter(c); reportArbiter(api, "arbiter_resume", 0); return; }
             case SDLK_1: player_error(c, ACTIVE_LEFT);  reportArbiter(api, "error_white", 0); return;
             case SDLK_2: player_error(c, ACTIVE_RIGHT); reportArbiter(api, "error_black", 0); return;
             case SDLK_3: add_bonus_time(c, ACTIVE_LEFT,  2000); reportArbiter(api, "bonus_white", 2000); return;
@@ -924,9 +1050,6 @@ static void handle_game_events(ClockState* c, AppResources* a, ApiClient* api,
     }
     if (x >= 350 && x <= 500 && y >= 325 && y <= 385) { a->mode = UI_MODE_ARBITER; return; }
 
-    // Klik połowy zegara: jeśli jesteśmy w pauzie, wznów grę i przekaż ruch
-    // tak, jakby zawodnik nacisnął swój przycisk (naturalne zachowanie zegara
-    // szachowego). Jeśli jest STOP arbitra — nic nie rób, niech arbiter wznowi.
     ActiveSide side = (x < WINDOW_WIDTH / 2) ? ACTIVE_LEFT : ACTIVE_RIGHT;
     if (c->state == STATE_PAUSED) {
         c->state = STATE_RUNNING;
@@ -949,11 +1072,9 @@ static void handle_arbiter_events(ClockState* c, AppResources* a, ApiClient* api
     }
     if (x >=  80 && x <= 300 && y >=  90 && y <= 155) {
         if (c->state == STATE_STOPPED_BY_ARBITER) {
-            resume_by_arbiter(c);
-            reportArbiter(api, "arbiter_resume", 0);
+            resume_by_arbiter(c); reportArbiter(api, "arbiter_resume", 0);
         } else {
-            stop_by_arbiter(c);
-            reportArbiter(api, "arbiter_stop", 0);
+            stop_by_arbiter(c);   reportArbiter(api, "arbiter_stop", 0);
         }
         return;
     }
@@ -964,9 +1085,7 @@ static void handle_arbiter_events(ClockState* c, AppResources* a, ApiClient* api
     if (x >= 620 && x <= 840 && y >= 175 && y <= 240) { a->mode = UI_MODE_GAME; return; }
 }
 
-// Z ekranu QR/parowania można wyjść BEZ parowania — ESC lub X przenosi do
-// setupu (zegar działa normalnie offline). Powrót do QR: klawisz B
-// z setupu/gry. Pełne zamknięcie aplikacji: ESC z setupu.
+// F9: w QR mode samo Q nie zamyka aplikacji (myli z innymi ekranami).
 static void handle_qr_events(AppResources* a, const SDL_Event* e, bool* running) {
     if (e->type == SDL_QUIT) { *running = false; return; }
     if (e->type == SDL_KEYDOWN) {
@@ -975,11 +1094,6 @@ static void handle_qr_events(AppResources* a, const SDL_Event* e, bool* running)
             case SDLK_RETURN:
             case SDLK_SPACE:
                 a->mode = UI_MODE_SETUP;
-                return;
-            case SDLK_q:
-                // Q nadal pozwala wyjść z aplikacji od razu z ekranu QR
-                // (np. gdy uruchomiło się przez pomyłkę).
-                *running = false;
                 return;
         }
         return;
@@ -995,21 +1109,51 @@ static void handle_qr_events(AppResources* a, const SDL_Event* e, bool* running)
 static void ui_process_events(ClockState* c, AppResources* a, ApiClient* api,
                               bool* running) {
     SDL_Event e;
+    int processed = 0;
     while (SDL_PollEvent(&e)) {
-        // Globalny skrót: Ctrl+Q zawsze zamyka aplikację, niezależnie od trybu.
-        // Awaryjne wyjście, gdyby przycisk X w rogu był zasłonięty/niewidoczny.
+        // Awaryjne globalne wyjście: Ctrl+Q.
         if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_q &&
             (e.key.keysym.mod & KMOD_CTRL)) {
             *running = false;
             continue;
         }
+        // SDL_QUIT zawsze zamyka.
+        if (e.type == SDL_QUIT) { *running = false; continue; }
+
+        // Overlay końca gry: jeśli widoczny, pochłania klik na X i ESC, ale
+        // nie blokuje innych klawiszy (R, A, Q itp. nadal działają, w razie
+        // gdyby user chciał szybko zacząć kolejną grę).
+        if (a->overlay.visible && !a->overlay.dismissed) {
+            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) {
+                a->overlay.dismissed = true;
+                continue;
+            }
+            if (e.type == SDL_MOUSEBUTTONDOWN) {
+                // Współrzędne X muszą być spójne z draw_winner_overlay
+                // (OverlayLayout::PANEL_W=700, PANEL_H=240, CLOSE=44, MARGIN=12).
+                const int PANEL_W = 700, PANEL_H = 240;
+                const int CB = 44, CM = 12;
+                int px = (WINDOW_WIDTH  - PANEL_W) / 2;
+                int py = (WINDOW_HEIGHT - PANEL_H) / 2;
+                int cbx = px + PANEL_W - CB - CM;
+                int cby = py + CM;
+                int x = e.button.x, y = e.button.y;
+                if (x >= cbx && x <= cbx + CB &&
+                    y >= cby && y <= cby + CB) {
+                    a->overlay.dismissed = true;
+                }
+                // Klik gdziekolwiek indziej ignorujemy — nie wyzwalamy
+                // przypadkowo podświetlonego przycisku pod spodem.
+                continue;
+            }
+        }
+
         switch (a->mode) {
             case UI_MODE_QR:      handle_qr_events(a, &e, running);            break;
             case UI_MODE_SETUP:   handle_setup_events(c, a, &e, running);      break;
             case UI_MODE_ARBITER: handle_arbiter_events(c, a, api, &e, running); break;
             case UI_MODE_HELP:
-                if (e.type == SDL_QUIT) *running = false;
-                else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE)
+                if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE)
                     a->mode = UI_MODE_GAME;
                 else if (e.type == SDL_MOUSEBUTTONDOWN) {
                     int x = e.button.x, y = e.button.y;
@@ -1020,7 +1164,188 @@ static void ui_process_events(ClockState* c, AppResources* a, ApiClient* api,
             case UI_MODE_GAME:
             default:              handle_game_events(c, a, api, &e, running); break;
         }
+        // Bezpiecznik: nie utknij w pętli eventów na zawsze.
+        if (++processed > 256) break;
     }
+}
+
+// ─── Animated game-end overlay ──────────────────────────────────────────────
+
+// Wersja blit_text z alpha-modulacją tekstu (do animacji fade-in/out).
+static void blit_text_alpha(SDL_Renderer* r, TextCache& cache, TTF_Font* f,
+                            const char* text, SDL_Color col, int x, int y, Uint8 alpha,
+                            int* out_w = nullptr, int* out_h = nullptr) {
+    if (!text) return;
+    int w = 0, h = 0;
+    SDL_Texture* t = cache.get(r, f, text, col, &w, &h);
+    if (!t) return;
+    SDL_SetTextureAlphaMod(t, alpha);
+    SDL_Rect dst{x, y, w, h};
+    SDL_RenderCopy(r, t, nullptr, &dst);
+    SDL_SetTextureAlphaMod(t, 255);  // przywróć — ten sam tekstura jest w cache
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+}
+
+// Geometria panelu overlay — używana zarówno w renderze jak i w obsłudze
+// kliknięć, żeby były spójne.
+struct OverlayLayout {
+    static const int PANEL_W = 700;
+    static const int PANEL_H = 240;
+    static const int CLOSE_BTN_SIZE = 44;
+    static const int CLOSE_BTN_MARGIN = 12;
+
+    int panel_x() const { return (WINDOW_WIDTH  - PANEL_W) / 2; }
+    int panel_y() const { return (WINDOW_HEIGHT - PANEL_H) / 2; }
+    SDL_Rect close_rect() const {
+        return SDL_Rect{panel_x() + PANEL_W - CLOSE_BTN_SIZE - CLOSE_BTN_MARGIN,
+                        panel_y() + CLOSE_BTN_MARGIN,
+                        CLOSE_BTN_SIZE, CLOSE_BTN_SIZE};
+    }
+};
+
+static void draw_winner_overlay(SDL_Renderer* r, AppResources* a) {
+    if (!a->overlay.visible || a->overlay.dismissed) return;
+
+    uint32_t now = SDL_GetTicks();
+    uint32_t elapsed = now - a->overlay.start_ms;
+    const float ANIM_MS = 350.0f;
+    float t  = std::min(1.0f, (float)elapsed / ANIM_MS);
+    float te = 1.0f - std::pow(1.0f - t, 3.0f);   // ease-out cubic
+    Uint8 fade_alpha = (Uint8)(255.0f * te);
+
+    // Subtelny pulse po zakończeniu animacji (1.0 ± 1.5%).
+    float pulse = 1.0f;
+    if (t >= 1.0f) {
+        float pt = (float)(elapsed - ANIM_MS) / 1000.0f; // sekundy
+        pulse = 1.0f + 0.015f * std::sin(pt * 2.0f * 3.14159265f * 0.7f);
+    }
+
+    // Tło — półprzezroczysta zasłona.
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, 0, 0, 0, (Uint8)(190.0f * te));
+    SDL_Rect full{0, 0, WINDOW_WIDTH, WINDOW_HEIGHT};
+    SDL_RenderFillRect(r, &full);
+
+    // Panel — skalowany od 70% do 100% rozmiaru bazowego, plus pulse.
+    OverlayLayout ol;
+    float scale = (0.7f + 0.3f * te) * pulse;
+    int pw = (int)((float)OverlayLayout::PANEL_W * scale);
+    int ph = (int)((float)OverlayLayout::PANEL_H * scale);
+    int px = (WINDOW_WIDTH  - pw) / 2;
+    int py = (WINDOW_HEIGHT - ph) / 2;
+
+    // Kolor panelu zależy od zwycięzcy.
+    SDL_Color panel_bg, text_col;
+    if (a->overlay.winner_text == "REMIS") {
+        panel_bg = {70, 70, 95, fade_alpha};
+        text_col = {245, 245, 250, 255};
+    } else if (a->overlay.shown_for == STATE_FINISHED_LEFT_WIN) {
+        // BIALY wygrał — jasny panel, ciemny tekst.
+        panel_bg = {235, 235, 240, fade_alpha};
+        text_col = {25, 25, 35, 255};
+    } else {
+        // CZARNY wygrał — ciemny panel, jasny tekst.
+        panel_bg = {28, 30, 42, fade_alpha};
+        text_col = {245, 245, 250, 255};
+    }
+
+    SDL_Rect panel{px, py, pw, ph};
+    draw_filled_rounded_rect(r, panel, 16, panel_bg);
+
+    // Akcent — paseczek u góry panelu w kolorze "wygranego" gracza.
+    SDL_Color accent = (a->overlay.winner_text == "REMIS")
+        ? SDL_Color{120, 180, 220, fade_alpha}
+        : COLOR_ACCENT;
+    accent.a = fade_alpha;
+    SDL_Rect strip{px + 20, py + ph - 6, pw - 40, 4};
+    SDL_SetRenderDrawColor(r, accent.r, accent.g, accent.b, accent.a);
+    SDL_RenderFillRect(r, &strip);
+
+    // Tytuł — "BIALY WYGRAL" itp. Skalujemy ręcznie przez SDL_RenderCopy
+    // z dużym dst (tekst już jest cachowany w bazowym rozmiarze).
+    {
+        int tw = 0, th = 0;
+        SDL_Texture* tex = a->text_cache.get(r, a->font_xlarge,
+                                             a->overlay.winner_text.c_str(),
+                                             text_col, &tw, &th);
+        if (tex && tw > 0 && th > 0) {
+            int dst_w = (int)(tw * scale);
+            int dst_h = (int)(th * scale);
+            SDL_Rect dst{px + (pw - dst_w)/2, py + (int)(35 * scale), dst_w, dst_h};
+            SDL_SetTextureAlphaMod(tex, fade_alpha);
+            SDL_RenderCopy(r, tex, nullptr, &dst);
+            SDL_SetTextureAlphaMod(tex, 255);
+        }
+    }
+
+    // Powód (mniejszy tekst).
+    if (!a->overlay.reason_text.empty()) {
+        int tw = 0, th = 0;
+        SDL_Color rc = text_col;
+        SDL_Texture* tex = a->text_cache.get(r, a->font_medium,
+                                             a->overlay.reason_text.c_str(),
+                                             rc, &tw, &th);
+        if (tex && tw > 0 && th > 0) {
+            int dst_w = (int)(tw * scale);
+            int dst_h = (int)(th * scale);
+            SDL_Rect dst{px + (pw - dst_w)/2, py + (int)(150 * scale), dst_w, dst_h};
+            SDL_SetTextureAlphaMod(tex, (Uint8)(fade_alpha * 0.85f));
+            SDL_RenderCopy(r, tex, nullptr, &dst);
+            SDL_SetTextureAlphaMod(tex, 255);
+        }
+    }
+
+    // Przycisk X — zawsze w niezmiennej pozycji (klikanie spójne z layoutem).
+    SDL_Rect close = ol.close_rect();
+    if (t >= 0.6f) {  // przycisk pojawia się dopiero pod koniec animacji
+        SDL_Color cb_col = {200, 70, 70, fade_alpha};
+        draw_filled_rounded_rect(r, close, 8, cb_col);
+        int tw = 0, th = 0;
+        SDL_Color xcol{245, 245, 245, 255};
+        SDL_Texture* tex = a->text_cache.get(r, a->font_medium, "X", xcol, &tw, &th);
+        if (tex) {
+            SDL_SetTextureAlphaMod(tex, fade_alpha);
+            SDL_Rect xdst{close.x + (close.w - tw)/2, close.y + (close.h - th)/2, tw, th};
+            SDL_RenderCopy(r, tex, nullptr, &xdst);
+            SDL_SetTextureAlphaMod(tex, 255);
+        }
+    }
+}
+
+// Tłumaczenie kodu powodu na polski tekst dla overlay.
+static std::string overlay_reason_pl(const std::string& reason) {
+    if (reason == "timeout")    return "Przekroczenie czasu";
+    if (reason == "errors")     return "Dwa bledy zawodnika";
+    if (reason == "checkmate")  return "Mat";
+    if (reason == "stalemate")  return "Pat - remis";
+    return "";
+}
+
+// Aktualizacja stanu overlay na podstawie stanu zegara. Wywoływana raz na klatkę.
+static void update_overlay_state(AppResources& app, const ClockState& cs) {
+    bool finished = cs.state == STATE_FINISHED_LEFT_WIN ||
+                    cs.state == STATE_FINISHED_RIGHT_WIN ||
+                    cs.state == STATE_FINISHED_DRAW;
+
+    if (!finished) {
+        // Gra wróciła do aktywnego stanu — gotowi na następną.
+        app.overlay.visible = false;
+        app.overlay.dismissed = false;
+        return;
+    }
+
+    if (app.overlay.visible || app.overlay.dismissed) return;
+
+    // Pierwszy raz widzimy ten finished state — pokaż overlay.
+    app.overlay.visible   = true;
+    app.overlay.dismissed = false;
+    app.overlay.start_ms  = SDL_GetTicks();
+    app.overlay.shown_for = cs.state;
+    if      (cs.state == STATE_FINISHED_LEFT_WIN)  app.overlay.winner_text = "BIALY WYGRAL";
+    else if (cs.state == STATE_FINISHED_RIGHT_WIN) app.overlay.winner_text = "CZARNY WYGRAL";
+    else                                            app.overlay.winner_text = "REMIS";
+    app.overlay.reason_text = overlay_reason_pl(cs.finish_reason);
 }
 
 static void ui_render_frame(SDL_Renderer* r, AppResources* a, const ClockState* c) {
@@ -1032,13 +1357,17 @@ static void ui_render_frame(SDL_Renderer* r, AppResources* a, const ClockState* 
         case UI_MODE_GAME:
         default:              draw_game_screen(r, a, c);     break;
     }
+    // Overlay końca gry rysujemy na ekranach gry/arbitra — żeby było widać
+    // wynik nawet gdy ktoś wszedł do menu arbitra po zakończeniu.
+    if (a->mode == UI_MODE_GAME || a->mode == UI_MODE_ARBITER) {
+        draw_winner_overlay(r, a);
+    }
+    // F10: jeden RenderPresent na klatkę, BEZ VSYNC. Frame timing kontroluje
+    // SDL_Delay w głównej pętli.
+    SDL_RenderPresent(r);
 }
 
-// ─── HTTP relay (same behaviour as the old main.cpp) ────────────────────────
-//
-// Niskopoziomowe pomocnicze funkcje POST/GET. Wcześniej były wywoływane wprost
-// z głównej pętli — teraz używa ich wątek roboczy ApiClient, więc wątek UI
-// nie blokuje się na żadnym wywołaniu sieciowym (poprawka 1).
+// ─── HTTP relay ─────────────────────────────────────────────────────────────
 
 static std::string stripPort(const std::string& ip) {
     auto p = ip.find(':');
@@ -1051,28 +1380,75 @@ static int portFromHost(const std::string& host, int fallback) {
     try { return std::stoi(host.substr(p + 1)); } catch (...) { return fallback; }
 }
 
+// F2: nieblokujący connect z timeoutem przez select(). Sprawdza także
+// flagę abort co iterację — pozwala szybko zatrzymać wątek HTTP przy stop().
+static int connect_with_timeout(int sock, const sockaddr* addr, socklen_t alen,
+                                int timeout_ms, std::atomic<bool>* abort_flag) {
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
+
+    int rc = ::connect(sock, addr, alen);
+    if (rc == 0) {
+        fcntl(sock, F_SETFL, flags);  // tryb blokujący z powrotem
+        return 0;
+    }
+    if (errno != EINPROGRESS) return -1;
+
+    int elapsed = 0;
+    const int slice = 200;
+    while (elapsed < timeout_ms) {
+        if (abort_flag && abort_flag->load()) { errno = ECANCELED; return -1; }
+        fd_set wf; FD_ZERO(&wf); FD_SET(sock, &wf);
+        struct timeval tv{0, slice * 1000};
+        rc = ::select(sock + 1, nullptr, &wf, nullptr, &tv);
+        if (rc < 0) {
+            if (errno == EINTR) { elapsed += slice; continue; }
+            return -1;
+        }
+        if (rc > 0) {
+            int err = 0; socklen_t elen = sizeof(err);
+            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &elen) < 0) return -1;
+            if (err != 0) { errno = err; return -1; }
+            fcntl(sock, F_SETFL, flags);
+            return 0;
+        }
+        elapsed += slice;
+    }
+    errno = ETIMEDOUT;
+    return -1;
+}
+
 static std::string httpPost(const std::string& ip, int port,
                             const std::string& path, const std::string& body,
-                            const std::string& clockCode = "",
-                            const std::string& apiKey = "") {
+                            const std::string& clockCode,
+                            const std::string& apiKey,
+                            std::atomic<bool>* abort_flag) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         LOG_ERR(std::string("httpPost socket() failed: ") + std::strerror(errno));
         return "";
     }
 
-    struct timeval tv{5, 0};
+    struct timeval tv{HTTP_IO_TIMEOUT_MS / 1000, (HTTP_IO_TIMEOUT_MS % 1000) * 1000};
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    int one = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(port);
-    inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+    if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
+        close(sock);
+        LOG_ERR("httpPost: bad IP " + ip);
+        return "";
+    }
 
-    if (connect(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
-        LOG_ERR("httpPost connect() failed for " + ip + ":" + std::to_string(port) +
-                " path=" + path + " errno=" + std::to_string(errno));
+    if (connect_with_timeout(sock, (sockaddr*)&addr, sizeof(addr),
+                             HTTP_CONNECT_TIMEOUT_MS, abort_flag) < 0) {
+        LOG_WARN("httpPost connect() failed for " + ip + ":" + std::to_string(port) +
+                 " path=" + path + " errno=" + std::to_string(errno));
         close(sock);
         return "";
     }
@@ -1086,8 +1462,8 @@ static std::string httpPost(const std::string& ip, int port,
     if (!apiKey.empty())    req << "X-API-Key: "    << apiKey    << "\r\n";
     req << "Connection: close\r\n\r\n" << body;
     std::string r = req.str();
-    if (send(sock, r.c_str(), r.size(), 0) < 0) {
-        LOG_ERR("httpPost send() failed for path=" + path);
+    if (send(sock, r.c_str(), r.size(), MSG_NOSIGNAL) < 0) {
+        LOG_WARN("httpPost send() failed for path=" + path);
         close(sock);
         return "";
     }
@@ -1096,32 +1472,35 @@ static std::string httpPost(const std::string& ip, int port,
     char buf[4096];
     int n;
     while ((n = recv(sock, buf, sizeof(buf) - 1, 0)) > 0) {
+        if (abort_flag && abort_flag->load()) break;
         buf[n] = '\0';
         response += buf;
+        if (response.size() > 256 * 1024) break; // ochrona pamięci
     }
     close(sock);
     return response;
 }
 
-// ─── HTTP GET z opcjonalnymi nagłówkami autoryzacji ─────────────────────────
-
 static std::string httpGet(const std::string& ip, int port,
                            const std::string& path,
-                           const std::string& clockCode = "",
-                           const std::string& apiKey = "") {
+                           const std::string& clockCode,
+                           const std::string& apiKey,
+                           std::atomic<bool>* abort_flag) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return "";
-
-    struct timeval tv{3, 0}; // 3-sekundowy timeout dla weryfikacji
+    struct timeval tv{HTTP_IO_TIMEOUT_MS / 1000, (HTTP_IO_TIMEOUT_MS % 1000) * 1000};
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(port);
-    inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+    if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
+        close(sock); return "";
+    }
 
-    if (connect(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
+    if (connect_with_timeout(sock, (sockaddr*)&addr, sizeof(addr),
+                             HTTP_CONNECT_TIMEOUT_MS, abort_flag) < 0) {
         LOG_WARN("httpGet connect() failed for " + ip + ":" + std::to_string(port) +
                  " path=" + path);
         close(sock);
@@ -1135,25 +1514,26 @@ static std::string httpGet(const std::string& ip, int port,
     if (!apiKey.empty())    req << "X-API-Key: "    << apiKey    << "\r\n";
     req << "Connection: close\r\n\r\n";
     std::string r = req.str();
-    send(sock, r.c_str(), r.size(), 0);
+    send(sock, r.c_str(), r.size(), MSG_NOSIGNAL);
 
     std::string response;
     char buf[4096];
     int n;
     while ((n = recv(sock, buf, sizeof(buf) - 1, 0)) > 0) {
+        if (abort_flag && abort_flag->load()) break;
         buf[n] = '\0';
         response += buf;
+        if (response.size() > 256 * 1024) break;
     }
     close(sock);
     return response;
 }
 
-// Weryfikuje klucz API przez GET /api/clock/info.
-// Zwraca true jeśli serwer odpowiedział {"ok":true, ...}.
 static bool verifyApiKey(const std::string& ip, int port,
                          const std::string& clockCode, const std::string& apiKey) {
     if (clockCode.empty() || apiKey.empty() || ip.empty()) return false;
-    std::string resp = httpGet(ip, port, "/api/clock/info", clockCode, apiKey);
+    std::atomic<bool> abort_flag{false};
+    std::string resp = httpGet(ip, port, "/api/clock/info", clockCode, apiKey, &abort_flag);
     auto bodyPos = resp.find("\r\n\r\n");
     std::string body = (bodyPos != std::string::npos) ? resp.substr(bodyPos + 4) : resp;
     return body.find("\"ok\":true")  != std::string::npos ||
@@ -1178,13 +1558,7 @@ static std::string parseGameId(const std::string& response) {
     return response.substr(s, e - s);
 }
 
-// ─── ApiClient — asynchroniczny klient HTTP z kolejką offline ────────────────
-//
-// Poprawki 1, 2, 4: cała komunikacja HTTP odbywa się w osobnym wątku, a żądania
-// są kolejkowane. Jeśli serwer nie odpowiada (timeout, brak Wi-Fi), wątek wraca
-// do kolejki z exponential backoff i ponawia próbę. Kolejka jest też zapisywana
-// na dysk po każdej zmianie, aby restart aplikacji nie gubił niewysłanych
-// ruchów. Akcje arbitra (PAUSE/RESUME/BONUS itd.) raportowane są jako kind=K_ARBITER.
+// ─── ApiClient ──────────────────────────────────────────────────────────────
 
 enum ApiKind {
     K_NEWGAME = 0,
@@ -1195,18 +1569,17 @@ enum ApiKind {
 
 struct PendingRequest {
     ApiKind     kind;
-    // wspólne pola — zależne od kind
-    std::string white;          // K_NEWGAME
-    std::string black;          // K_NEWGAME
-    long long   tcMs = 0;       // K_NEWGAME
-    std::string uci;            // K_MOVE
-    std::string color;          // K_MOVE  ("White" | "Black")
-    long long   timeLeftMs = 0; // K_MOVE
-    std::string status;         // K_STATUS
-    std::string winner;         // K_STATUS
-    std::string action;         // K_ARBITER ("pause", "resume", "bonus_white", ...)
-    long long   value = 0;      // K_ARBITER (np. czas bonusu w ms)
-    long long   tsMs  = 0;      // znacznik czasu utworzenia (epoch ms)
+    std::string white;
+    std::string black;
+    long long   tcMs = 0;
+    std::string uci;
+    std::string color;
+    long long   timeLeftMs = 0;
+    std::string status;
+    std::string winner;
+    std::string action;
+    long long   value = 0;
+    long long   tsMs  = 0;
     int         attempts = 0;
 };
 
@@ -1228,6 +1601,8 @@ public:
         loadQueue();
         running_ = true;
         thr_ = std::thread(&ApiClient::workerLoop, this);
+        // F2: osobny wątek persist z debounce — UI/worker nigdy nie blokują na SD.
+        persist_thr_ = std::thread(&ApiClient::persistLoop, this);
         LOG_INFO("ApiClient started (queue size=" + std::to_string(queue_.size()) + ")");
     }
 
@@ -1237,9 +1612,12 @@ public:
             std::lock_guard<std::mutex> g(qmu_);
             running_ = false;
         }
+        abort_flag_.store(true);  // przerwij blokujące I/O w workerze
         qcv_.notify_all();
+        persist_cv_.notify_all();
         if (thr_.joinable()) thr_.join();
-        persistQueue(); // ostatni zapis przy wyjściu
+        if (persist_thr_.joinable()) persist_thr_.join();
+        persistQueueNow(); // ostatni zapis przy wyjściu
         LOG_INFO("ApiClient stopped (queue size=" + std::to_string(queue_.size()) + ")");
     }
 
@@ -1249,7 +1627,6 @@ public:
         return queue_.size();
     }
 
-    // Enqueue helpers
     void enqueueNewGame(const std::string& white, const std::string& black, long long tcMs) {
         if (!networked_) return;
         PendingRequest r{}; r.kind = K_NEWGAME;
@@ -1275,7 +1652,6 @@ public:
         push(std::move(r));
     }
 
-    // GameID handling — ustawiane po udanym NEWGAME, czytane przez MOVE/STATUS/ARBITER
     void setGameId(const std::string& gid) {
         std::lock_guard<std::mutex> g(idmu_);
         gameId_ = gid;
@@ -1300,16 +1676,18 @@ private:
             std::lock_guard<std::mutex> g(qmu_);
             queue_.push_back(std::move(r));
         }
-        persistQueue();
+        // F2: nie persistuj synchronicznie — tylko zaznacz, że treba zapisać.
+        markDirty();
         qcv_.notify_one();
     }
 
-    // Główna pętla wątku roboczego: wyciąga jedno żądanie, próbuje wysłać,
-    // przy niepowodzeniu wraca do kolejki z backoffem. NEWGAME ma priorytet —
-    // bez game_id nie da się wysłać niczego innego.
+    void markDirty() {
+        dirty_.store(true);
+        persist_cv_.notify_one();
+    }
+
     void workerLoop() {
         int backoff = HTTP_BACKOFF_BASE_MS;
-
         while (true) {
             PendingRequest req;
             {
@@ -1320,23 +1698,25 @@ private:
                 queue_.pop_front();
             }
 
-            // Jeśli żądanie wymaga game_id, a go nie mamy — zaczekaj na NEWGAME
-            // (cofnij na początek kolejki, śpij i spróbuj jeszcze raz).
             if (req.kind != K_NEWGAME && gameId().empty()) {
-                std::lock_guard<std::mutex> g(qmu_);
-                queue_.push_front(std::move(req));
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                {
+                    std::lock_guard<std::mutex> g(qmu_);
+                    queue_.push_front(std::move(req));
+                }
+                std::unique_lock<std::mutex> g(qmu_);
+                qcv_.wait_for(g, std::chrono::milliseconds(500),
+                              [&]{ return !running_.load(); });
+                if (!running_.load()) return;
                 continue;
             }
 
             bool ok = trySend(req);
             if (ok) {
                 backoff = HTTP_BACKOFF_BASE_MS;
-                persistQueue();
+                markDirty();
                 continue;
             }
 
-            // Niepowodzenie — wstaw z powrotem na początek kolejki i czekaj.
             req.attempts++;
             LOG_WARN("ApiClient send failed (kind=" + std::to_string(req.kind) +
                      " attempts=" + std::to_string(req.attempts) +
@@ -1345,14 +1725,28 @@ private:
                 std::lock_guard<std::mutex> g(qmu_);
                 queue_.push_front(std::move(req));
             }
-            persistQueue();
+            markDirty();
 
-            // Backoff z maksimum, przerywany przez stop().
             std::unique_lock<std::mutex> g(qmu_);
             qcv_.wait_for(g, std::chrono::milliseconds(backoff),
                           [&]{ return !running_.load(); });
             if (!running_.load()) return;
             backoff = std::min(backoff * 2, HTTP_BACKOFF_MAX_MS);
+        }
+    }
+
+    // F2: osobny wątek persist. Debounce: jeśli wiele zmian w krótkim czasie,
+    // zapisuje tylko raz na ~250 ms. Atomic write: najpierw .tmp, potem rename.
+    void persistLoop() {
+        while (running_.load()) {
+            std::unique_lock<std::mutex> g(persist_mu_);
+            persist_cv_.wait_for(g, std::chrono::milliseconds(QUEUE_PERSIST_MIN_INTERVAL_MS),
+                                 [&]{ return !running_.load() || dirty_.load(); });
+            if (!running_.load()) break;
+            if (dirty_.exchange(false)) {
+                g.unlock();
+                persistQueueNow();
+            }
         }
     }
 
@@ -1372,7 +1766,7 @@ private:
           << "\"black_player\":\""  << r.black << "\","
           << "\"time_control_ms\":" << r.tcMs << "}";
         std::string resp = httpPost(ip_, port_, "/api/clock/newgame", b.str(),
-                                    clockCode_, apiKey_);
+                                    clockCode_, apiKey_, &abort_flag_);
         if (resp.empty()) return false;
         std::string gid = parseGameId(resp);
         if (gid.empty()) {
@@ -1393,7 +1787,7 @@ private:
           << "\"player\":\"" << r.color << "\","
           << "\"time_left_ms\":" << r.timeLeftMs << "}";
         std::string resp = httpPost(ip_, port_, "/api/clock/move", b.str(),
-                                    clockCode_, apiKey_);
+                                    clockCode_, apiKey_, &abort_flag_);
         return !resp.empty();
     }
 
@@ -1405,7 +1799,7 @@ private:
           << "\"status\":\"" << r.status << "\","
           << "\"winner\":\"" << r.winner << "\"}";
         std::string resp = httpPost(ip_, port_, "/api/clock/status", b.str(),
-                                    clockCode_, apiKey_);
+                                    clockCode_, apiKey_, &abort_flag_);
         return !resp.empty();
     }
 
@@ -1418,41 +1812,46 @@ private:
           << "\"value_ms\":" << r.value << ","
           << "\"ts_ms\":"    << r.tsMs  << "}";
         std::string resp = httpPost(ip_, port_, "/api/clock/arbiter", b.str(),
-                                    clockCode_, apiKey_);
+                                    clockCode_, apiKey_, &abort_flag_);
         return !resp.empty();
     }
 
-    // ─── Persystencja kolejki na dysk ───────────────────────────────────────
-    // Format: linia per żądanie, pola rozdzielone TAB-em. Pierwsza linia to
-    // GAMEID|<gid> (jeśli znany). Pozwala odzyskać niewysłane żądania po
-    // restarcie programu lub Pi (np. po awarii zasilania w trakcie turnieju).
-
-    void persistQueue() {
+    // F2: atomic write — najpierw .tmp, potem rename. Awaria zasilania nie
+    // pozostawi uszkodzonego pliku.
+    void persistQueueNow() {
         if (queueFile_.empty()) return;
-        std::ofstream f(queueFile_, std::ios::trunc);
+        std::string tmp = queueFile_ + ".tmp";
+        std::ofstream f(tmp, std::ios::trunc);
         if (!f.good()) {
-            LOG_WARN("Cannot write queue file: " + queueFile_);
+            LOG_WARN("Cannot write queue tmp file: " + tmp);
             return;
         }
         f << "GAMEID\t" << gameId() << "\n";
-        std::lock_guard<std::mutex> g(qmu_);
-        for (const auto& r : queue_) {
-            f << r.kind << "\t";
-            switch (r.kind) {
-                case K_NEWGAME:
-                    f << escape(r.white) << "\t" << escape(r.black) << "\t" << r.tcMs;
-                    break;
-                case K_MOVE:
-                    f << escape(r.uci) << "\t" << escape(r.color) << "\t" << r.timeLeftMs;
-                    break;
-                case K_STATUS:
-                    f << escape(r.status) << "\t" << escape(r.winner);
-                    break;
-                case K_ARBITER:
-                    f << escape(r.action) << "\t" << r.value;
-                    break;
+        {
+            std::lock_guard<std::mutex> g(qmu_);
+            for (const auto& r : queue_) {
+                f << r.kind << "\t";
+                switch (r.kind) {
+                    case K_NEWGAME:
+                        f << escape(r.white) << "\t" << escape(r.black) << "\t" << r.tcMs;
+                        break;
+                    case K_MOVE:
+                        f << escape(r.uci) << "\t" << escape(r.color) << "\t" << r.timeLeftMs;
+                        break;
+                    case K_STATUS:
+                        f << escape(r.status) << "\t" << escape(r.winner);
+                        break;
+                    case K_ARBITER:
+                        f << escape(r.action) << "\t" << r.value;
+                        break;
+                }
+                f << "\t" << r.tsMs << "\t" << r.attempts << "\n";
             }
-            f << "\t" << r.tsMs << "\t" << r.attempts << "\n";
+        }
+        f.flush();
+        f.close();
+        if (std::rename(tmp.c_str(), queueFile_.c_str()) != 0) {
+            LOG_WARN("Cannot rename queue file: " + std::string(std::strerror(errno)));
         }
     }
 
@@ -1480,33 +1879,25 @@ private:
                 switch (r.kind) {
                     case K_NEWGAME:
                         if (tokens.size() < 6) continue;
-                        r.white = unescape(tokens[1]);
-                        r.black = unescape(tokens[2]);
-                        r.tcMs  = std::stoll(tokens[3]);
-                        r.tsMs  = std::stoll(tokens[4]);
+                        r.white = unescape(tokens[1]); r.black = unescape(tokens[2]);
+                        r.tcMs  = std::stoll(tokens[3]); r.tsMs = std::stoll(tokens[4]);
                         r.attempts = std::stoi(tokens[5]);
                         break;
                     case K_MOVE:
                         if (tokens.size() < 6) continue;
-                        r.uci   = unescape(tokens[1]);
-                        r.color = unescape(tokens[2]);
-                        r.timeLeftMs = std::stoll(tokens[3]);
-                        r.tsMs  = std::stoll(tokens[4]);
+                        r.uci   = unescape(tokens[1]); r.color = unescape(tokens[2]);
+                        r.timeLeftMs = std::stoll(tokens[3]); r.tsMs = std::stoll(tokens[4]);
                         r.attempts = std::stoi(tokens[5]);
                         break;
                     case K_STATUS:
                         if (tokens.size() < 5) continue;
-                        r.status = unescape(tokens[1]);
-                        r.winner = unescape(tokens[2]);
-                        r.tsMs   = std::stoll(tokens[3]);
-                        r.attempts = std::stoi(tokens[4]);
+                        r.status = unescape(tokens[1]); r.winner = unescape(tokens[2]);
+                        r.tsMs = std::stoll(tokens[3]); r.attempts = std::stoi(tokens[4]);
                         break;
                     case K_ARBITER:
                         if (tokens.size() < 5) continue;
-                        r.action = unescape(tokens[1]);
-                        r.value  = std::stoll(tokens[2]);
-                        r.tsMs   = std::stoll(tokens[3]);
-                        r.attempts = std::stoi(tokens[4]);
+                        r.action = unescape(tokens[1]); r.value = std::stoll(tokens[2]);
+                        r.tsMs = std::stoll(tokens[3]); r.attempts = std::stoi(tokens[4]);
                         break;
                 }
                 queue_.push_back(std::move(r));
@@ -1561,23 +1952,33 @@ private:
     std::string queueFile_;
 
     std::thread thr_;
+    std::thread persist_thr_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> abort_flag_{false};
+    std::atomic<bool> dirty_{false};
     std::mutex qmu_;
     std::condition_variable qcv_;
+    std::mutex persist_mu_;
+    std::condition_variable persist_cv_;
     std::deque<PendingRequest> queue_;
 
     std::mutex idmu_;
     std::string gameId_;
 };
 
-// Definicja zapowiedzianej wcześniej funkcji raportującej akcje arbitra.
-// Wywoływana z UI/keyboard handlerów, przesyła komendę do ApiClient (poprawka 4).
 static void reportArbiter(ApiClient* api, const std::string& action, long long valueMs) {
     if (!api || !api->networked()) return;
     api->enqueueArbiter(action, valueMs);
 }
 
-// ─── Bluetooth RFCOMM server ────────────────────────────────────────────────
+// ─── BluetoothServer (F1, F5, F7) ───────────────────────────────────────────
+//
+// Trzy wątki:
+//   - acceptLoop: accept() + recv() (klient → kolejka odbiorcza)
+//   - sendLoop:   wysyła wiadomości z kolejki nadawczej (NIE blokuje UI)
+//   - main UI thread czyta z kolejki odbiorczej i wkłada do nadawczej
+//
+// cli_sock_ jest atomic + chroniony krótkim mutexem dla mocniejszej semantyki.
 
 class BluetoothServer {
 public:
@@ -1593,20 +1994,27 @@ public:
 
 private:
     void acceptLoop();
+    void sendLoop();
+    void closeClientLocked();   // wywoływane z trzymanym sock_mu_
 
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
-    std::thread       thr_;
+    std::thread       accept_thr_;
+    std::thread       send_thr_;
+
     int               srv_sock_ = -1;
-    int               cli_sock_ = -1;
+    std::atomic<int>  cli_sock_{-1};
+    std::mutex        sock_mu_;   // chroni operacje na cli_sock_
     int               channel_  = DEFAULT_BT_CHAN;
     std::string       mac_      = "(niedostepne)";
 
-    std::mutex               qmu_;
-    std::deque<std::string>  queue_;
+    std::mutex               in_mu_;
+    std::deque<std::string>  in_queue_;
     std::string              recv_buffer_;
 
-    std::mutex write_mu_;
+    std::mutex               out_mu_;
+    std::condition_variable  out_cv_;
+    std::deque<std::string>  out_queue_;
 };
 
 bool BluetoothServer::start(int channel) {
@@ -1624,7 +2032,6 @@ bool BluetoothServer::start(int channel) {
 
     srv_sock_ = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
     if (srv_sock_ < 0) {
-        std::perror("bluetooth socket()");
         LOG_ERR(std::string("bluetooth socket() failed: ") + std::strerror(errno));
         return false;
     }
@@ -1636,29 +2043,48 @@ bool BluetoothServer::start(int channel) {
     loc.rc_channel          = static_cast<uint8_t>(channel);
 
     if (bind(srv_sock_, (sockaddr*)&loc, sizeof(loc)) < 0) {
-        std::perror("bluetooth bind()");
         LOG_ERR(std::string("bluetooth bind() failed: ") + std::strerror(errno));
         close(srv_sock_); srv_sock_ = -1;
         return false;
     }
     if (listen(srv_sock_, 1) < 0) {
-        std::perror("bluetooth listen()");
         LOG_ERR(std::string("bluetooth listen() failed: ") + std::strerror(errno));
         close(srv_sock_); srv_sock_ = -1;
         return false;
     }
 
     running_ = true;
-    thr_ = std::thread(&BluetoothServer::acceptLoop, this);
+    accept_thr_ = std::thread(&BluetoothServer::acceptLoop, this);
+    send_thr_   = std::thread(&BluetoothServer::sendLoop,   this);
     LOG_INFO("BluetoothServer listening on RFCOMM channel " + std::to_string(channel));
     return true;
 }
 
+void BluetoothServer::closeClientLocked() {
+    int cs = cli_sock_.exchange(-1);
+    if (cs >= 0) {
+        ::shutdown(cs, SHUT_RDWR);
+        close(cs);
+    }
+    connected_ = false;
+}
+
 void BluetoothServer::stop() {
     running_ = false;
-    if (cli_sock_ >= 0) { ::shutdown(cli_sock_, SHUT_RDWR); close(cli_sock_); cli_sock_ = -1; }
-    if (srv_sock_ >= 0) { ::shutdown(srv_sock_, SHUT_RDWR); close(srv_sock_); srv_sock_ = -1; }
-    if (thr_.joinable()) thr_.join();
+
+    {
+        std::lock_guard<std::mutex> g(sock_mu_);
+        closeClientLocked();
+        if (srv_sock_ >= 0) {
+            ::shutdown(srv_sock_, SHUT_RDWR);
+            close(srv_sock_);
+            srv_sock_ = -1;
+        }
+    }
+    out_cv_.notify_all();
+
+    if (accept_thr_.joinable()) accept_thr_.join();
+    if (send_thr_.joinable())   send_thr_.join();
 }
 
 void BluetoothServer::acceptLoop() {
@@ -1668,74 +2094,162 @@ void BluetoothServer::acceptLoop() {
         int cs = accept(srv_sock_, (sockaddr*)&rem, &len);
         if (cs < 0) {
             if (!running_) return;
-            std::perror("bluetooth accept()");
             LOG_WARN(std::string("bluetooth accept() failed: ") + std::strerror(errno));
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;
         }
-        cli_sock_ = cs;
-        connected_ = true;
+
+        // F1: Ustawiamy timeouty wysyłania i odbioru, by send() i recv() nie
+        // blokowały w nieskończoność jeśli klient się zawiesi.
+        struct timeval tv_send{BT_SEND_TIMEOUT_MS / 1000,
+                               (BT_SEND_TIMEOUT_MS % 1000) * 1000};
+        setsockopt(cs, SOL_SOCKET, SO_SNDTIMEO, &tv_send, sizeof(tv_send));
+        struct timeval tv_recv{30, 0};  // generous timeout dla recv (heartbeat protection)
+        setsockopt(cs, SOL_SOCKET, SO_RCVTIMEO, &tv_recv, sizeof(tv_recv));
+
         {
-            std::lock_guard<std::mutex> g(qmu_);
-            queue_.push_back("__BT_CONNECTED__");
+            std::lock_guard<std::mutex> g(sock_mu_);
+            cli_sock_.store(cs);
         }
+        connected_ = true;
+
+        {
+            std::lock_guard<std::mutex> g(in_mu_);
+            in_queue_.push_back("__BT_CONNECTED__");
+            if (in_queue_.size() > BT_QUEUE_MAX) in_queue_.pop_front();
+        }
+        out_cv_.notify_all();
 
         char buf[1024];
         while (running_.load()) {
             int n = recv(cs, buf, sizeof(buf) - 1, 0);
-            if (n <= 0) break;
-            buf[n] = '\0';
+            if (n == 0) break;             // klient zamknął
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue; // recv timeout — OK, sprawdź running
+                if (errno == EINTR) continue;
+                break;                     // realny błąd
+            }
+
+            // F5: limit bufora przed dopisaniem.
+            if (recv_buffer_.size() + (size_t)n > BT_RECV_BUFFER_MAX) {
+                LOG_WARN("BT recv_buffer overflow — czyszczenie");
+                recv_buffer_.clear();
+            }
             recv_buffer_.append(buf, n);
+
             size_t pos;
             while ((pos = recv_buffer_.find('\n')) != std::string::npos) {
                 std::string line = recv_buffer_.substr(0, pos);
                 recv_buffer_.erase(0, pos + 1);
                 if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.size() > BT_LINE_MAX) {
+                    LOG_WARN("BT line too long — odrzucam");
+                    continue;
+                }
                 if (!line.empty()) {
-                    std::lock_guard<std::mutex> g(qmu_);
-                    queue_.push_back(line);
+                    std::lock_guard<std::mutex> g(in_mu_);
+                    if (in_queue_.size() < BT_QUEUE_MAX) {
+                        in_queue_.push_back(std::move(line));
+                    } else {
+                        LOG_WARN("BT in_queue full — drop");
+                    }
                 }
             }
         }
 
-        close(cs);
-        cli_sock_ = -1;
-        connected_ = false;
+        {
+            std::lock_guard<std::mutex> g(sock_mu_);
+            closeClientLocked();
+        }
         recv_buffer_.clear();
         {
-            std::lock_guard<std::mutex> g(qmu_);
-            queue_.push_back("__BT_DISCONNECTED__");
+            std::lock_guard<std::mutex> g(in_mu_);
+            in_queue_.push_back("__BT_DISCONNECTED__");
+            if (in_queue_.size() > BT_QUEUE_MAX) in_queue_.pop_front();
+        }
+        out_cv_.notify_all();  // obudź sender, niech zauważy disconnect
+    }
+}
+
+// F1: osobny wątek wysyłający. Bierze wiadomości z kolejki, pisze na socket
+// z timeoutem (SO_SNDTIMEO). Jeśli send() zwróci błąd, wiadomość JEST PORZUCANA
+// (bo i tak klient odpadł — kolejne CLOCK|... pojawi się za 500 ms).
+void BluetoothServer::sendLoop() {
+    while (running_.load()) {
+        std::string msg;
+        {
+            std::unique_lock<std::mutex> g(out_mu_);
+            out_cv_.wait(g, [&]{ return !running_.load() || !out_queue_.empty(); });
+            if (!running_.load() && out_queue_.empty()) return;
+            if (out_queue_.empty()) continue;
+            msg = std::move(out_queue_.front());
+            out_queue_.pop_front();
+        }
+
+        int cs = cli_sock_.load();
+        if (cs < 0) continue;  // brak klienta — porzuć wiadomość
+
+        if (msg.empty() || msg.back() != '\n') msg.push_back('\n');
+
+        ssize_t off = 0;
+        bool failed = false;
+        while (off < (ssize_t)msg.size()) {
+            ssize_t n = send(cs, msg.data() + off, msg.size() - off, MSG_NOSIGNAL);
+            if (n <= 0) {
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    LOG_WARN("BT send timeout — klient nieresponsywny, zamykam");
+                } else {
+                    LOG_WARN("BT send error: " + std::string(std::strerror(errno)));
+                }
+                failed = true;
+                break;
+            }
+            off += n;
+        }
+
+        // Jeśli klient nie odbiera, wymuś rozłączenie — niech acceptLoop
+        // zauważy disconnect i przyjmie nowe połączenie. Tablet sam się
+        // zsynchronizuje przez SYNC_REQUEST.
+        if (failed) {
+            std::lock_guard<std::mutex> g(sock_mu_);
+            closeClientLocked();
         }
     }
 }
 
 bool BluetoothServer::pop_line(std::string& out) {
-    std::lock_guard<std::mutex> g(qmu_);
-    if (queue_.empty()) return false;
-    out = std::move(queue_.front());
-    queue_.pop_front();
+    std::lock_guard<std::mutex> g(in_mu_);
+    if (in_queue_.empty()) return false;
+    out = std::move(in_queue_.front());
+    in_queue_.pop_front();
     return true;
 }
 
+// F1: send_line WRZUCA do kolejki i kończy. Nigdy nie blokuje wątku UI.
 void BluetoothServer::send_line(const std::string& line) {
-    std::lock_guard<std::mutex> g(write_mu_);
-    if (cli_sock_ < 0) return;
-    std::string msg = line;
-    if (msg.empty() || msg.back() != '\n') msg.push_back('\n');
-    ssize_t off = 0;
-    while (off < (ssize_t)msg.size()) {
-        ssize_t n = send(cli_sock_, msg.data() + off, msg.size() - off, MSG_NOSIGNAL);
-        if (n <= 0) {
-            LOG_WARN("BluetoothServer send_line failed (errno=" + std::to_string(errno) + ")");
-            break;
+    if (!is_connected()) return;
+    {
+        std::lock_guard<std::mutex> g(out_mu_);
+        if (out_queue_.size() >= BT_SEND_QUEUE_MAX) {
+            // Zalewa nas kolejka nadawcza (klient nie odbiera). Wyrzuć stare
+            // CLOCK|... — i tak nieaktualne. Zostaw OK/ERR/MOVE_ACCEPTED/GAME_OVER.
+            for (auto it = out_queue_.begin(); it != out_queue_.end();) {
+                if (it->rfind("CLOCK|", 0) == 0) it = out_queue_.erase(it);
+                else ++it;
+                if (out_queue_.size() < BT_SEND_QUEUE_MAX / 2) break;
+            }
+            if (out_queue_.size() >= BT_SEND_QUEUE_MAX) {
+                LOG_WARN("BT out_queue full — dropping line");
+                return;
+            }
         }
-        off += n;
+        out_queue_.push_back(line);
     }
+    out_cv_.notify_one();
 }
 
 // ─── Bluetooth command handling ─────────────────────────────────────────────
 
-// Dane sesji rozszerzono o sekwencję ruchów i kontekst ACK (poprawki 6 i 8).
 struct Session {
     Board                   board{};
     std::list<std::string>  moveHistory;
@@ -1748,13 +2262,9 @@ struct Session {
     int                     setupIncrement = INCREMENT_SECONDS;
     bool                    over       = false;
 
-    // Ochrona przed podwójnym ruchem (poprawka 8).
-    // - lastAcceptedSeq: ostatni odebrany numer sekwencji (jeśli klient go używa).
-    // - lastAcceptedUci: UCI ostatnio przyjętego ruchu.
     int                     lastAcceptedSeq = -1;
     std::string             lastAcceptedUci;
 
-    // Kontekst potwierdzenia odbioru GAME_OVER (poprawka 6).
     bool                    awaiting_ack = false;
     std::string             ack_context;
     std::string             ack_message;
@@ -1780,8 +2290,6 @@ static std::string trim(std::string s) {
     return s.substr(i);
 }
 
-// Rozpoczyna wysyłanie z gwarantowanym potwierdzeniem (poprawka 6).
-// Tablet musi odesłać "ACK|<context>" — inaczej wiadomość będzie retransmitowana.
 static void send_with_ack(BluetoothServer& bt, Session& sess,
                           const std::string& context, const std::string& message) {
     sess.awaiting_ack    = true;
@@ -1799,7 +2307,6 @@ static void clear_ack(Session& sess) {
     sess.ack_retries = 0;
 }
 
-// W głównej pętli: jeżeli czekamy na ACK i upłynął timeout, retransmitujemy.
 static void tick_ack(BluetoothServer& bt, Session& sess) {
     if (!sess.awaiting_ack) return;
     if (!bt.is_connected()) return;
@@ -1818,6 +2325,20 @@ static void tick_ack(BluetoothServer& bt, Session& sess) {
              " try=" + std::to_string(sess.ack_retries) + ")");
 }
 
+// F6: bezpieczne tworzenie boardu — Board ctor może rzucić.
+static bool resetBoardSafe(Board& b) {
+    try {
+        b = Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        return true;
+    } catch (const std::exception& e) {
+        LOG_ERR(std::string("Board reset failed: ") + e.what());
+        return false;
+    } catch (...) {
+        LOG_ERR("Board reset failed: unknown");
+        return false;
+    }
+}
+
 static void startNewGame(Session& sess, AppResources& app, ClockState& cs,
                          BluetoothServer& bt, ApiClient& api,
                          const std::string& white, const std::string& black,
@@ -1825,7 +2346,10 @@ static void startNewGame(Session& sess, AppResources& app, ClockState& cs,
     sess.whiteName = white.empty() ? "White" : white;
     sess.blackName = black.empty() ? "Black" : black;
     sess.moveHistory.clear();
-    sess.board = Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+    if (!resetBoardSafe(sess.board)) {
+        bt.send_line("ERR|board_init_failed");
+        return;
+    }
     sess.over  = false;
     sess.lastAcceptedSeq = -1;
     sess.lastAcceptedUci.clear();
@@ -1850,8 +2374,6 @@ static void startNewGame(Session& sess, AppResources& app, ClockState& cs,
     app.mode = UI_MODE_GAME;
 
     if (sess.networked) {
-        // Serwer otrzyma NEWGAME asynchronicznie. Czyszczenie game_id sygnalizuje
-        // ApiClient-owi, że MOVE/STATUS muszą poczekać na nowe game_id.
         api.clearGameId();
         api.enqueueNewGame(sess.whiteName, sess.blackName,
                            sess.tcEnabled ? sess.startMs : 0);
@@ -1864,8 +2386,6 @@ static void startNewGame(Session& sess, AppResources& app, ClockState& cs,
              std::to_string(sess.setupIncrement) + "s");
 }
 
-// Normalizuje UCI: 5. znak (figura promocji) zawsze małymi literami.
-// Akceptuje też 4-znakowe ruchy zwykłe (poprawka 5).
 static bool normalizeUci(std::string& uci) {
     if (uci.size() != 4 && uci.size() != 5) return false;
     if (uci.size() == 5) {
@@ -1876,82 +2396,83 @@ static bool normalizeUci(std::string& uci) {
     return true;
 }
 
-static void tryMove(Session& sess, AppResources& app, ClockState& cs,
+// F6: tryMove opakowuje ruchy chess-library w try/catch — żaden wyjątek nie
+// rozsadzi aplikacji.
+static void tryMove(Session& sess, AppResources& /*app*/, ClockState& cs,
                     BluetoothServer& bt, ApiClient& api,
                     int seq, std::string uciStr) {
     if (sess.over) { bt.send_line("ERR|game_over"); return; }
 
-    // Walidacja długości (4 lub 5 znaków dla promocji) — poprawka 5.
     if (!normalizeUci(uciStr)) {
         bt.send_line("ERR|bad_format|" + uciStr);
         return;
     }
 
-    // Dedup po sekwencji (poprawka 8): jeśli klient podał ten sam seq co ostatnio,
-    // ruch był już zaakceptowany — odeślij DUP zamiast ERR.
     if (seq >= 0 && seq == sess.lastAcceptedSeq) {
         bt.send_line("DUP|" + uciStr);
         return;
     }
-    // Dedup po UCI: szybki podwójny tap wysyłający ten sam ruch (najczęstszy
-    // przypadek bez sekwencji).
     if (!sess.lastAcceptedUci.empty() && sess.lastAcceptedUci == uciStr) {
         bt.send_line("DUP|" + uciStr);
         return;
     }
 
-    Movelist moves;
-    movegen::legalmoves(moves, sess.board);
-    if (moves.size() == 0) { bt.send_line("ERR|no_legal_moves"); return; }
+    try {
+        Movelist moves;
+        movegen::legalmoves(moves, sess.board);
+        if (moves.size() == 0) { bt.send_line("ERR|no_legal_moves"); return; }
 
-    bool isWhiteTurn = (sess.board.sideToMove() == Color::WHITE);
+        bool isWhiteTurn = (sess.board.sideToMove() == Color::WHITE);
 
-    Move m;
-    try { m = uci::uciToMove(sess.board, uciStr); }
-    catch (...) { bt.send_line("ERR|bad_format|" + uciStr); return; }
+        Move m;
+        try { m = uci::uciToMove(sess.board, uciStr); }
+        catch (...) { bt.send_line("ERR|bad_format|" + uciStr); return; }
 
-    bool legal = false;
-    for (auto mv : moves) if (uci::moveToUci(mv) == uciStr) { legal = true; break; }
-    if (!legal) { bt.send_line("ERR|illegal_move|" + uciStr); return; }
+        bool legal = false;
+        for (auto mv : moves) if (uci::moveToUci(mv) == uciStr) { legal = true; break; }
+        if (!legal) { bt.send_line("ERR|illegal_move|" + uciStr); return; }
 
-    sess.board.makeMove(m);
-    sess.moveHistory.push_back(uciStr);
-    sess.lastAcceptedSeq = seq;
-    sess.lastAcceptedUci = uciStr;
+        sess.board.makeMove(m);
+        sess.moveHistory.push_back(uciStr);
+        sess.lastAcceptedSeq = seq;
+        sess.lastAcceptedUci = uciStr;
 
-    // Drive the clock exactly the way a physical press would.
-    ActiveSide side = isWhiteTurn ? ACTIVE_LEFT : ACTIVE_RIGHT;
-    if (cs.state != STATE_RUNNING) cs.state = STATE_RUNNING;
-    switch_side(&cs, side);
+        ActiveSide side = isWhiteTurn ? ACTIVE_LEFT : ACTIVE_RIGHT;
+        if (cs.state != STATE_RUNNING) cs.state = STATE_RUNNING;
+        switch_side(&cs, side);
 
-    long long timeLeftMs = isWhiteTurn ? cs.left.remaining_ms : cs.right.remaining_ms;
-    std::string playerColor = isWhiteTurn ? "White" : "Black";
-    if (sess.networked)
-        api.enqueueMove(uciStr, playerColor, sess.tcEnabled ? timeLeftMs : 0);
-    bt.send_line("MOVE_ACCEPTED|" + uciStr);
-
-    // Detect end of game.
-    Movelist next;
-    movegen::legalmoves(next, sess.board);
-    if (next.size() == 0) {
-        std::string status, winner;
-        if (sess.board.inCheck()) {
-            status = "checkmate";
-            winner = (sess.board.sideToMove() == Color::WHITE) ? "Black" : "White";
-            cs.state = (winner == "White") ? STATE_FINISHED_LEFT_WIN : STATE_FINISHED_RIGHT_WIN;
-        } else {
-            status = "stalemate";
-            winner = "Draw";
-            cs.state = STATE_FINISHED_DRAW;
-        }
-        sess.over = true;
+        long long timeLeftMs = isWhiteTurn ? cs.left.remaining_ms : cs.right.remaining_ms;
+        std::string playerColor = isWhiteTurn ? "White" : "Black";
         if (sess.networked)
-            api.enqueueStatus(status, winner);
-        // Poprawka 6: GAME_OVER wymaga ACK, dlatego retransmitujemy aż dostaniemy
-        // potwierdzenie z tabletu (lub przekroczymy max retransmisji).
-        send_with_ack(bt, sess, "game_over",
-                      "GAME_OVER|" + winner + "|" + status);
-        LOG_INFO("Game over: winner=" + winner + " status=" + status);
+            api.enqueueMove(uciStr, playerColor, sess.tcEnabled ? timeLeftMs : 0);
+        bt.send_line("MOVE_ACCEPTED|" + uciStr);
+
+        Movelist next;
+        movegen::legalmoves(next, sess.board);
+        if (next.size() == 0) {
+            std::string status, winner;
+            if (sess.board.inCheck()) {
+                status = "checkmate";
+                winner = (sess.board.sideToMove() == Color::WHITE) ? "Black" : "White";
+                cs.state = (winner == "White") ? STATE_FINISHED_LEFT_WIN : STATE_FINISHED_RIGHT_WIN;
+                cs.finish_reason = "checkmate";
+            } else {
+                status = "stalemate"; winner = "Draw";
+                cs.state = STATE_FINISHED_DRAW;
+                cs.finish_reason = "stalemate";
+            }
+            sess.over = true;
+            if (sess.networked) api.enqueueStatus(status, winner);
+            send_with_ack(bt, sess, "game_over",
+                          "GAME_OVER|" + winner + "|" + status);
+            LOG_INFO("Game over: winner=" + winner + " status=" + status);
+        }
+    } catch (const std::exception& e) {
+        LOG_ERR(std::string("tryMove exception: ") + e.what());
+        bt.send_line("ERR|engine_exception");
+    } catch (...) {
+        LOG_ERR("tryMove unknown exception");
+        bt.send_line("ERR|engine_exception");
     }
 }
 
@@ -1968,9 +2489,6 @@ static void checkTimeout(Session& sess, ClockState& cs, BluetoothServer& bt,
     LOG_INFO("Timeout: winner=" + winner);
 }
 
-// Wysyła pełny snapshot stanu (poprawka 3): nazwy graczy, kontrolę czasu,
-// aktualny stan zegara i całą historię ruchów. Wywoływane na komendę
-// SYNC_REQUEST tabletu (np. po reconnect).
 static void sendFullSync(BluetoothServer& bt, const Session& sess, const ClockState& cs) {
     bt.send_line("SYNC_BEGIN");
     {
@@ -2010,9 +2528,8 @@ static void handleBluetoothCommand(const std::string& line,
         app.bt_status = "Telefon polaczony. Oczekiwanie na NEWGAME...";
         if (app.mode == UI_MODE_QR) app.mode = UI_MODE_SETUP;
         bt.send_line("HELLO|chess_clock_pi");
-        // Po reconnecie warto retransmitować GAME_OVER, jeśli wciąż czekamy na ACK.
         if (sess.awaiting_ack) {
-            sess.ack_last_sent_ms = SDL_GetTicks() - ACK_TIMEOUT_MS; // wymusza retransmit
+            sess.ack_last_sent_ms = SDL_GetTicks() - ACK_TIMEOUT_MS;
         }
         LOG_INFO("Bluetooth client connected");
         return;
@@ -2031,7 +2548,6 @@ static void handleBluetoothCommand(const std::string& line,
     if (cmd == "HELLO")  { bt.send_line("OK|hello"); return; }
 
     if (cmd == "ACK") {
-        // Klient potwierdza odbiór wiadomości — np. ACK|game_over.
         if (parts.size() >= 2 && sess.awaiting_ack && parts[1] == sess.ack_context) {
             LOG_INFO("Received ACK for context=" + parts[1]);
             clear_ack(sess);
@@ -2039,10 +2555,7 @@ static void handleBluetoothCommand(const std::string& line,
         return;
     }
 
-    if (cmd == "SYNC_REQUEST") {
-        sendFullSync(bt, sess, cs);
-        return;
-    }
+    if (cmd == "SYNC_REQUEST") { sendFullSync(bt, sess, cs); return; }
 
     if (cmd == "PAUSE") {
         GameState before = cs.state;
@@ -2069,7 +2582,7 @@ static void handleBluetoothCommand(const std::string& line,
         sess.lastAcceptedSeq = -1;
         sess.lastAcceptedUci.clear();
         clear_ack(sess);
-        sess.board = Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        resetBoardSafe(sess.board);
         api.enqueueArbiter("reset", 0);
         bt.send_line("OK|reset");
         return;
@@ -2099,8 +2612,6 @@ static void handleBluetoothCommand(const std::string& line,
 
     if (cmd == "MOVE") {
         if (parts.size() < 2) { bt.send_line("ERR|move_requires_uci"); return; }
-        // Dwa formaty: MOVE|<seq>|<uci>  lub  MOVE|<uci>  (legacy).
-        // Sekwencja musi być liczbą całkowitą — to nas różnicuje od starego formatu.
         int seq = -1;
         std::string uciStr;
         if (parts.size() >= 3 &&
@@ -2153,10 +2664,6 @@ struct AppConfig {
     std::string logFile    = DEFAULT_LOG_FILE;
 };
 
-// ─── Parser JSON dla clock.json ────────────────────────────────────────────────
-// Minimalny ekstraktor JSON — obsługuje tylko wartości tekstowe i całkowite.
-
-// Wyodrębnia wartość tekstową JSON dla danego klucza
 static std::string jsonString(const std::string& j, const std::string& key) {
     auto kpos = j.find("\"" + key + "\"");
     if (kpos == std::string::npos) return "";
@@ -2169,7 +2676,6 @@ static std::string jsonString(const std::string& j, const std::string& key) {
     return j.substr(q1 + 1, q2 - q1 - 1);
 }
 
-// Wyodrębnia wartość liczby całkowitej JSON dla danego klucza
 static int jsonInt(const std::string& j, const std::string& key, int fallback) {
     auto kpos = j.find("\"" + key + "\"");
     if (kpos == std::string::npos) return fallback;
@@ -2181,8 +2687,6 @@ static int jsonInt(const std::string& j, const std::string& key, int fallback) {
     try { return std::stoi(j.substr(s)); } catch (...) { return fallback; }
 }
 
-// Wczytuje clock.json (lub inną ścieżkę) i uzupełnia domyślne pola AppConfig
-// Argumenty wiersza poleceń zawsze mają wyższy priorytet niż wartości z JSON
 static void loadJsonConfig(AppConfig& c, const std::string& path = "clock.json") {
     std::ifstream f(path);
     if (!f.good()) return;
@@ -2210,7 +2714,6 @@ static void loadJsonConfig(AppConfig& c, const std::string& path = "clock.json")
         int bt = jsonInt(json, "bt_channel", 0);
         if (bt > 0) c.btChannel = bt;
     }
-    // Opcjonalne ścieżki kolejki i logu (użyteczne np. w /var/lib/chess-clock-pi)
     auto qf = jsonString(json, "queue_file");
     if (!qf.empty()) c.queueFile = qf;
     auto lf = jsonString(json, "log_file");
@@ -2233,45 +2736,81 @@ static AppConfig readConfig(int argc, char** argv) {
     return c;
 }
 
+// ─── Watchdog (F11) ─────────────────────────────────────────────────────────
+//
+// Twardy bezpiecznik: jeśli wątek UI nie zaktualizuje "heartbeatu" przez ponad
+// WATCHDOG_TIMEOUT_MS (5 s), watchdog wymusza wyjście (_Exit). To gwarantuje,
+// że nawet gdy coś nieoczekiwanie zablokuje główny wątek (np. driver SDL,
+// X server, błąd Mesy), użytkownik zawsze może odzyskać aplikację — wystarczy
+// ją uruchomić ponownie. Sam watchdog nie używa mutexów ani SDL — pisze do
+// stderr i wywołuje _Exit.
+
+static std::atomic<uint32_t> g_main_heartbeat_ms{0};
+static std::atomic<bool>     g_watchdog_running{false};
+static const uint32_t        WATCHDOG_TIMEOUT_MS = 5000;
+
+static void watchdog_thread_fn() {
+    // Uwaga: ten wątek MUSI być prosty i nie polegać na żadnym zasobie aplikacji.
+    while (g_watchdog_running.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (!g_watchdog_running.load()) break;
+        uint32_t hb = g_main_heartbeat_ms.load();
+        if (hb == 0) continue;  // jeszcze nie wystartowała pętla UI
+        uint32_t now = SDL_GetTicks();
+        if (now - hb > WATCHDOG_TIMEOUT_MS) {
+            std::fprintf(stderr,
+                "[WATCHDOG] UI thread bez heartbeatu od %u ms — wymuszam exit(2)\n",
+                now - hb);
+            // Spróbuj zapisać minimalną informację do osobnego pliku (logger
+            // mógł też utknąć).
+            std::FILE* wf = std::fopen("chess-clock-watchdog.log", "a");
+            if (wf) {
+                time_t t = std::time(nullptr);
+                std::tm tm{};
+                localtime_r(&t, &tm);
+                char tbuf[32];
+                std::strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &tm);
+                std::fprintf(wf, "%s WATCHDOG TRIGGERED stale=%u ms\n", tbuf, now - hb);
+                std::fclose(wf);
+            }
+            std::_Exit(2);  // _Exit nie wywołuje destruktorów, ale to OK
+        }
+    }
+}
+
 int main(int argc, char** argv) {
+    // Ignoruj SIGPIPE — i tak używamy MSG_NOSIGNAL, ale dla pewności.
+    signal(SIGPIPE, SIG_IGN);
+
     AppConfig cfg = readConfig(argc, argv);
 
-    // Logger — startujemy go jak najwcześniej, żeby błędy z inicjalizacji UI/BT
-    // też trafiały do pliku (poprawka 7).
     Logger::instance().open(cfg.logFile);
     LOG_INFO("=== chess_pi start ===");
     LOG_INFO("server=" + cfg.serverHost + " bt_channel=" + std::to_string(cfg.btChannel) +
              " queue=" + cfg.queueFile + " log=" + cfg.logFile);
 
     AppResources app;
-    if (!ui_init(&app)) { LOG_ERR("UI init failed"); return 1; }
+    if (!ui_init(&app)) { LOG_ERR("UI init failed"); Logger::instance().close(); return 1; }
     app.bt_channel = cfg.btChannel;
 
-    // ─── Weryfikacja klucza API przy starcie ─────────────────────────────────
     if (cfg.networked && !cfg.clockCode.empty() && !cfg.apiKey.empty()) {
         std::printf("[API] Weryfikacja klucza %s na %s:%d...\n",
                     cfg.clockCode.c_str(), cfg.serverIp.c_str(), cfg.serverPort);
         bool valid = verifyApiKey(cfg.serverIp, cfg.serverPort,
                                   cfg.clockCode, cfg.apiKey);
         if (valid) {
-            std::printf("[API] ✓ Klucz API poprawny — połączono z %s:%d\n",
-                        cfg.serverIp.c_str(), cfg.serverPort);
+            std::printf("[API] OK Klucz API poprawny\n");
             app.server_info = cfg.serverHost + "  ✓ API OK";
             LOG_INFO("API key verified");
         } else {
-            std::fprintf(stderr, "[API] ✗ Błąd weryfikacji — sprawdź clock.json lub uruchom serwer API\n");
+            std::fprintf(stderr, "[API] Bledna weryfikacja\n");
             app.server_info = cfg.serverHost + "  ✗ niepoprawny klucz";
             LOG_ERR("API key verification failed");
-            // Mimo niepowodzenia weryfikacji uruchamiamy ApiClient — kolejka i tak
-            // będzie się zapełniać, a po wymianie klucza (lub gdy serwer wstanie)
-            // żądania zostaną wysłane.
         }
     } else if (!cfg.serverHost.empty()) {
         app.server_info = cfg.serverHost;
     }
 
-    // ApiClient odpala wątek roboczy — od tej chwili wszystkie zapytania HTTP
-    // wykonuje on, a nie pętla główna (poprawka 1).
     ApiClient api;
     api.configure(cfg.networked, cfg.serverIp, cfg.serverPort,
                   cfg.clockCode, cfg.apiKey, cfg.queueFile);
@@ -2295,17 +2834,43 @@ int main(int argc, char** argv) {
     sess.networked = cfg.networked;
     sess.setupMinutes   = app.setup_minutes;
     sess.setupIncrement = app.setup_increment;
+    if (!resetBoardSafe(sess.board)) {
+        LOG_ERR("Initial board init failed — kontynuuję, NEWGAME odbuduje");
+    }
 
     bool app_running = true;
     uint32_t prev_tick = SDL_GetTicks();
     uint32_t last_clock_push = 0;
+    uint32_t last_frame_start = SDL_GetTicks();
+
+    // F11: Start watchdoga DOPIERO po pełnej inicjalizacji UI/BT/API. Heartbeat
+    // ustawiamy najpierw, by uniknąć fałszywego trafienia w pierwszej klatce.
+    g_main_heartbeat_ms.store(SDL_GetTicks());
+    g_watchdog_running.store(true);
+    std::thread watchdog_thr(watchdog_thread_fn);
+    LOG_INFO("Watchdog started (timeout=" + std::to_string(WATCHDOG_TIMEOUT_MS) + " ms)");
 
     while (app_running) {
+        uint32_t frame_begin = SDL_GetTicks();
+
+        // F11: heartbeat na samym początku klatki — watchdog wie, że żyjemy.
+        g_main_heartbeat_ms.store(frame_begin);
+
+        // F8: watchdog dla poprzedniej klatki (loguje, ale nie zabija).
+        if (frame_begin - last_frame_start > FRAME_WATCHDOG_MS) {
+            LOG_WARN("Frame took " +
+                     std::to_string(frame_begin - last_frame_start) + " ms (slow frame)");
+        }
+        last_frame_start = frame_begin;
+
         ui_process_events(&cs, &app, &api, &app_running);
 
+        // F5: limit liczby BT komend per frame, by nie zablokować UI floodem.
         std::string line;
-        while (bt.pop_line(line)) {
+        int processed = 0;
+        while (processed < BT_PER_FRAME_MAX && bt.pop_line(line)) {
             handleBluetoothCommand(line, sess, app, cs, bt, api);
+            processed++;
         }
 
         uint32_t now   = SDL_GetTicks();
@@ -2313,7 +2878,7 @@ int main(int argc, char** argv) {
         prev_tick      = now;
         update_clock(&cs, delta);
         checkTimeout(sess, cs, bt, api);
-        tick_ack(bt, sess);  // retransmisja GAME_OVER bez ACK (poprawka 6)
+        tick_ack(bt, sess);
 
         if (bt.is_connected() && now - last_clock_push > 500) {
             last_clock_push = now;
@@ -2321,17 +2886,28 @@ int main(int argc, char** argv) {
             os << "CLOCK|" << cs.left.remaining_ms << "|" << cs.right.remaining_ms
                << "|" << (cs.active == ACTIVE_LEFT ? "white" : "black")
                << "|" << (int)cs.state;
-            bt.send_line(os.str());
+            bt.send_line(os.str());  // F1: nie blokuje (kolejka)
         }
 
+        // Stan animowanego komunikatu końca gry — tuż przed renderem, by
+        // pokazać/ukryć overlay zgodnie z aktualnym stanem zegara.
+        update_overlay_state(app, cs);
+
         ui_render_frame(app.renderer, &app, &cs);
-        SDL_Delay(1000 / FPS);
+
+        // Adaptywny delay — jeśli klatka była wolna, nie dodawaj 33 ms.
+        uint32_t frame_time = SDL_GetTicks() - frame_begin;
+        uint32_t target = 1000 / FPS;
+        if (frame_time < target) SDL_Delay(target - frame_time);
     }
 
     LOG_INFO("Shutting down...");
+    g_watchdog_running.store(false);
+    if (watchdog_thr.joinable()) watchdog_thr.join();
     bt.stop();
-    api.stop();   // czeka na wątek HTTP, zapisuje kolejkę na dysk
+    api.stop();
     ui_cleanup(&app);
     LOG_INFO("=== chess_pi stop ===");
+    Logger::instance().close();
     return 0;
 }
