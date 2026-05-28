@@ -63,6 +63,7 @@
 #include <iomanip>
 #include <iostream>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -414,6 +415,8 @@ struct AppResources {
     std::string   bt_mac;
     int           bt_channel   = DEFAULT_BT_CHAN;
     std::string   bt_status    = "Oczekiwanie na polaczenie Bluetooth...";
+    int           bt_peer_count = 0;          // ile tabletów podłączonych (0..MAX_PEERS)
+    int           bt_peer_max   = 2;          // = BluetoothServer::MAX_PEERS
     std::string   server_info;
     TextCache     text_cache;
     WinnerOverlay overlay;
@@ -610,8 +613,37 @@ static void draw_setup_screen(SDL_Renderer* r, AppResources* a) {
     draw_button(r, a->text_cache, a->font_small, &minus_inc, false);
     draw_button(r, a->text_cache, a->font_small, &plus_inc,  false);
 
-    Button start_btn{{340, 130, 300, 70}, "ROZP. GRE", false};
-    draw_button(r, a->text_cache, a->font_medium, &start_btn, false);
+    // START button — szary i nieaktywny dopóki nie podłączą się 2 tablety.
+    bool ready = (a->bt_peer_count >= a->bt_peer_max);
+    Button start_btn{{340, 130, 300, 70},
+                     ready ? "ROZP. GRE" : "CZEKAM NA 2 TABLETY",
+                     false};
+    if (ready) {
+        draw_button(r, a->text_cache, a->font_medium, &start_btn, false);
+    } else {
+        draw_colored_button(r, a->text_cache, a->font_small, &start_btn,
+                            COLOR_INACTIVE, COLOR_INACTIVE, false);
+    }
+
+    // Status peerów — duża etykieta poniżej START.
+    char peer_buf[80];
+    if (a->bt_peer_count == 0) {
+        std::snprintf(peer_buf, sizeof(peer_buf),
+            "Brak tabletow. Wlacz Bluetooth i znajdz 'Chess-Clock-Pi'.");
+    } else if (a->bt_peer_count < a->bt_peer_max) {
+        std::snprintf(peer_buf, sizeof(peer_buf),
+            "Oczekiwanie na tablety... (%d/%d)",
+            a->bt_peer_count, a->bt_peer_max);
+    } else {
+        std::snprintf(peer_buf, sizeof(peer_buf),
+            "Gotowe — oba tablety podlaczone (%d/%d).",
+            a->bt_peer_count, a->bt_peer_max);
+    }
+    int pw = 0, ph = 0;
+    SDL_Color peer_col = ready ? COLOR_ACCENT : SDL_Color{200, 150, 80, 255};
+    measure_text(r, a->text_cache, a->font_small, peer_buf, peer_col, &pw, &ph);
+    blit_text(r, a->text_cache, a->font_small, peer_buf, peer_col,
+              (WINDOW_WIDTH - pw)/2, 215);
 
     int tw = 0, th = 0;
     const char* hh = "Kliknij +/- aby ustawic, potem START  (telefon moze wyslac NEWGAME)";
@@ -854,7 +886,8 @@ struct Session;
 static void reportArbiter(ApiClient* api, const std::string& action, long long valueMs);
 static void tryMove(Session& sess, AppResources& app, ClockState& cs,
                     BluetoothServer& bt, ApiClient& api,
-                    int seq, std::string uciStr, bool is_commit = false);
+                    int src_peer_id, int seq, std::string uciStr,
+                    bool is_commit = false);
 
 // ─── Animated game-end overlay ──────────────────────────────────────────────
 
@@ -1420,7 +1453,9 @@ public:
         running_ = true;
         thr_ = std::thread(&ApiClient::workerLoop, this);
         persist_thr_ = std::thread(&ApiClient::persistLoop, this);
-        LOG_INFO("ApiClient started (queue size=" + std::to_string(queue_.size()) + ")");
+        hb_thr_ = std::thread(&ApiClient::heartbeatLoop, this);
+        LOG_INFO("ApiClient started (queue size=" + std::to_string(queue_.size()) +
+                 ", heartbeat=" + std::to_string(HB_INTERVAL_MS) + "ms)");
     }
 
     void stop() {
@@ -1434,6 +1469,7 @@ public:
         persist_cv_.notify_all();
         if (thr_.joinable()) thr_.join();
         if (persist_thr_.joinable()) persist_thr_.join();
+        if (hb_thr_.joinable()) hb_thr_.join();
         persistQueueNow();
         LOG_INFO("ApiClient stopped (queue size=" + std::to_string(queue_.size()) + ")");
     }
@@ -1474,6 +1510,21 @@ public:
     PairResult pairWithCode(const std::string& code) {
         if (!networked_) return PairResult{false, "no_network", "", ""};
         return apiPair(ip_, port_, clockCode_, code);
+    }
+
+    // ── Heartbeat (live clock push) ────────────────────────────────────────
+    // Nadpisuje cache najnowszych wartości. Wątek hbLoop_ co ~HB_INTERVAL_MS
+    // wysyła POST /api/clock/heartbeat ze świeżymi liczbami. Brak retry, brak
+    // persistencji — kolejny pakiet i tak będzie świeższy.
+    void enqueueHeartbeat(long long whiteMs, long long blackMs) {
+        if (!networked_) return;
+        std::lock_guard<std::mutex> g(hb_mu_);
+        hb_white_ms_  = whiteMs;
+        hb_black_ms_  = blackMs;
+        hb_has_data_  = true;
+        // Nie notyfikujemy CV — wątek i tak wysyła co HB_INTERVAL_MS
+        // (wybudzanie częściej tylko marnuje CPU; ostatnie wartości i tak
+        // będą wysłane w następnym cyklu).
     }
 
     void setGameId(const std::string& gid) {
@@ -1783,6 +1834,50 @@ private:
 
     std::mutex idmu_;
     std::string gameId_;
+
+    // ── Heartbeat state ────────────────────────────────────────────────────
+    // ~co HB_INTERVAL_MS hbLoop_ pcha aktualny stan zegara na serwer.
+    // Lekki POST (krótka wartość, krótki timeout), bez kolejki.
+    static constexpr int HB_INTERVAL_MS = 500;
+    std::thread             hb_thr_;
+    std::mutex              hb_mu_;
+    long long               hb_white_ms_ = 0;
+    long long               hb_black_ms_ = 0;
+    bool                    hb_has_data_ = false;
+
+    void heartbeatLoop() {
+        using namespace std::chrono;
+        while (running_.load()) {
+            // Czekaj HB_INTERVAL_MS, ale obudź się natychmiast jeśli running_=false
+            // (stop() ustawia abort_flag_; sprawdzamy w pętli).
+            for (int slept = 0; slept < HB_INTERVAL_MS && running_.load(); slept += 50) {
+                std::this_thread::sleep_for(milliseconds(50));
+            }
+            if (!running_.load()) return;
+
+            long long w = 0, b = 0;
+            bool have = false;
+            {
+                std::lock_guard<std::mutex> g(hb_mu_);
+                w = hb_white_ms_;
+                b = hb_black_ms_;
+                have = hb_has_data_;
+            }
+            if (!have) continue;
+
+            std::string gid = gameId();
+            if (gid.empty()) continue; // partia jeszcze nieutworzona na serwerze
+
+            std::ostringstream body;
+            body << "{\"game_id\":" << gid
+                 << ",\"white_ms\":" << w
+                 << ",\"black_ms\":" << b << "}";
+            // Fire-and-forget — wynik ignorujemy. Krótki timeout (httpPost
+            // używa abort_flag_ + ma własny timeout per OpenSSL).
+            (void)httpPost(ip_, port_, "/api/clock/heartbeat", body.str(),
+                           clockCode_, apiKey_, &abort_flag_);
+        }
+    }
 };
 
 static void reportArbiter(ApiClient* api, const std::string& action, long long valueMs) {
@@ -1792,42 +1887,153 @@ static void reportArbiter(ApiClient* api, const std::string& action, long long v
 
 // ─── BluetoothServer ─────────────────────────────────────────────────────────
 
+// BtPeer — jedna fizyczna sesja RFCOMM. Każdy peer ma własny socket, własne
+// kolejki I/O i własną parę wątków (reader + sender). Lifetime jest zarządzany
+// przez std::shared_ptr — gdy wszystkie referencje wygasną (vector peers_ +
+// detached threads), struct jest niszczony. Dzięki temu accept loop nie musi
+// joinować nic — wystarczy że usunie shared_ptr z vectora.
+struct BtPeer {
+    int                       id          = 0;
+    int                       sock        = -1;
+    std::string               addr;          // "AA:BB:CC:DD:EE:FF" — do log i remove
+    std::string               recv_buffer;
+    std::mutex                out_mu;
+    std::condition_variable   out_cv;
+    std::deque<std::string>   out_queue;
+    std::atomic<bool>         alive{true};
+};
+
 class BluetoothServer {
 public:
     bool start(int channel);
     void stop();
 
-    bool is_connected() const { return connected_.load(); }
-    bool pop_line(std::string& out);
-    void send_line(const std::string& line);
+    int  connected_count() const;
+    bool is_connected()   const { return connected_count() > 0; }
+
+    // Pop next inbound event from queue. src_peer_id identyfikuje od którego
+    // peera przyszła linia (potrzebne do forwardingu i targetowanych odpowiedzi).
+    // System events (__BT_CONNECTED__ / __BT_DISCONNECTED__) też mają peer_id.
+    bool pop_line(std::string& out, int& src_peer_id);
+
+    // Broadcast do wszystkich połączonych peerów. Używane przez main loop dla
+    // CLOCK|... oraz przez ack-retransmit (oba muszą trafić do obu tabletów).
+    int  send_line(const std::string& line);
+
+    // Targetowany wysyłka — używana do odpowiedzi na komendy konkretnego peera
+    // (OK|hello, ERR|illegal_move) i do initial sync nowo-dołączonego peera.
+    int  send_line_to(int peer_id, const std::string& line);
+
+    // Broadcast do wszystkich peerów OPRÓCZ except_peer_id — używane do
+    // forwardingu ruchów (sender już ma swój echo, nie chcemy duplikatu).
+    int  send_line_except(int except_peer_id, const std::string& line);
 
     std::string mac()     const { return mac_; }
     int         channel() const { return channel_; }
 
+    static constexpr size_t MAX_PEERS = 2;
+
 private:
     void acceptLoop();
-    void sendLoop();
-    void closeClientLocked();
+    void readerLoop(std::shared_ptr<BtPeer> peer);
+    void senderLoop(std::shared_ptr<BtPeer> peer);
+    void enableDiscoverable();
+    void forgetAllPairedDevices();
+    void pushInEvent(std::string line, int peer_id);
+    void enqueueToPeer(BtPeer& peer, const std::string& line);
 
-    std::atomic<bool> running_{false};
-    std::atomic<bool> connected_{false};
-    std::thread       accept_thr_;
-    std::thread       send_thr_;
+    std::atomic<bool>                       running_{false};
+    std::thread                             accept_thr_;
+    int                                     srv_sock_ = -1;
+    int                                     channel_  = DEFAULT_BT_CHAN;
+    std::string                             mac_      = "(niedostepne)";
+    std::atomic<int>                        next_peer_id_{1};
 
-    int               srv_sock_ = -1;
-    std::atomic<int>  cli_sock_{-1};
-    std::mutex        sock_mu_;
-    int               channel_  = DEFAULT_BT_CHAN;
-    std::string       mac_      = "(niedostepne)";
+    mutable std::mutex                      peers_mu_;
+    std::vector<std::shared_ptr<BtPeer>>    peers_;
 
-    std::mutex               in_mu_;
-    std::deque<std::string>  in_queue_;
-    std::string              recv_buffer_;
-
-    std::mutex               out_mu_;
-    std::condition_variable  out_cv_;
-    std::deque<std::string>  out_queue_;
+    struct InEvent { std::string line; int peer_id; };
+    mutable std::mutex                      in_mu_;
+    std::deque<InEvent>                     in_queue_;
 };
+
+// ── Helpers — discoverability + zapomnij sparowane ─────────────────────────
+
+void BluetoothServer::enableDiscoverable() {
+    // Spróbuj programatycznie przez HCI; fallback do shella (hciconfig) gdy
+    // bez uprawnień. Cel: zegar jest WIDOCZNY (inquiry scan) + można się z nim
+    // POŁĄCZYĆ (page scan) zawsze przy starcie, niezależnie od stanu systemu.
+    int dev_id = hci_get_route(nullptr);
+    if (dev_id >= 0) {
+        int hci_sock = hci_open_dev(dev_id);
+        if (hci_sock >= 0) {
+            uint8_t scan_enable = SCAN_INQUIRY | SCAN_PAGE;
+            // HCI_OP_WRITE_SCAN_ENABLE = OGF 0x03, OCF 0x001A
+            struct hci_request rq{};
+            rq.ogf    = OGF_HOST_CTL;
+            rq.ocf    = OCF_WRITE_SCAN_ENABLE;
+            rq.cparam = &scan_enable;
+            rq.clen   = sizeof(scan_enable);
+            uint8_t status = 0;
+            rq.rparam = &status;
+            rq.rlen   = sizeof(status);
+            if (hci_send_req(hci_sock, &rq, 1000) == 0 && status == 0) {
+                LOG_INFO("BT: discoverable + connectable (HCI scan enable)");
+            } else {
+                LOG_WARN("BT: HCI write_scan_enable failed, fallback to hciconfig");
+                if (system("hciconfig hci0 piscan >/dev/null 2>&1") == 0) {
+                    LOG_INFO("BT: discoverable (via hciconfig hci0 piscan)");
+                }
+            }
+            // Ustaw nazwę widoczną dla skanerów.
+            const char* nm = "Chess-Clock-Pi";
+            if (hci_write_local_name(hci_sock, const_cast<char*>(nm), 2000) == 0) {
+                LOG_INFO("BT: local name set to 'Chess-Clock-Pi'");
+            }
+            hci_close_dev(hci_sock);
+        } else {
+            LOG_WARN("BT: hci_open_dev failed — używam hciconfig fallback");
+            if (system("hciconfig hci0 piscan >/dev/null 2>&1") == 0) {
+                LOG_INFO("BT: discoverable (via hciconfig hci0 piscan)");
+            }
+            system("hciconfig hci0 name 'Chess-Clock-Pi' >/dev/null 2>&1");
+        }
+    }
+}
+
+void BluetoothServer::forgetAllPairedDevices() {
+    // Cel: czysty stan przy następnym uruchomieniu. Wyciągamy MAC-i wszystkich
+    // sparowanych urządzeń przez `bluetoothctl paired-devices` (część pakietu
+    // bluez — runtime dependency, nie build) i każdy usuwamy. Bez zależności
+    // od D-Bus / libbluetooth pairing API.
+    FILE* f = popen("bluetoothctl --timeout 2 paired-devices 2>/dev/null", "r");
+    if (!f) {
+        LOG_WARN("BT forget: popen(bluetoothctl) failed");
+        return;
+    }
+    std::vector<std::string> macs;
+    char buf[256];
+    // Format linii: "Device AA:BB:CC:DD:EE:FF FriendlyName"
+    while (fgets(buf, sizeof(buf), f)) {
+        std::string l(buf);
+        auto a = l.find(' ');
+        auto b = (a != std::string::npos) ? l.find(' ', a + 1) : std::string::npos;
+        if (a != std::string::npos && b != std::string::npos) {
+            macs.push_back(l.substr(a + 1, b - a - 1));
+        }
+    }
+    pclose(f);
+    for (const auto& m : macs) {
+        std::string cmd = "bluetoothctl --timeout 2 remove " + m + " >/dev/null 2>&1";
+        if (system(cmd.c_str()) == 0) {
+            LOG_INFO("BT: forgot " + m);
+        } else {
+            LOG_WARN("BT: forget " + m + " failed");
+        }
+    }
+}
+
+// ── Lifecycle ──────────────────────────────────────────────────────────────
 
 bool BluetoothServer::start(int channel) {
     channel_ = channel;
@@ -1842,6 +2048,9 @@ bool BluetoothServer::start(int channel) {
         }
     }
 
+    // Zawsze wykrywalny przy starcie (wymaganie #1).
+    enableDiscoverable();
+
     srv_sock_ = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
     if (srv_sock_ < 0) {
         LOG_ERR(std::string("bluetooth socket() failed: ") + std::strerror(errno));
@@ -1849,17 +2058,19 @@ bool BluetoothServer::start(int channel) {
     }
 
     sockaddr_rc loc{};
-    loc.rc_family           = AF_BLUETOOTH;
+    loc.rc_family  = AF_BLUETOOTH;
     bdaddr_t any_addr{{0,0,0,0,0,0}};
-    loc.rc_bdaddr           = any_addr;
-    loc.rc_channel          = static_cast<uint8_t>(channel);
+    loc.rc_bdaddr  = any_addr;
+    loc.rc_channel = static_cast<uint8_t>(channel);
 
     if (bind(srv_sock_, (sockaddr*)&loc, sizeof(loc)) < 0) {
         LOG_ERR(std::string("bluetooth bind() failed: ") + std::strerror(errno));
         close(srv_sock_); srv_sock_ = -1;
         return false;
     }
-    if (listen(srv_sock_, 1) < 0) {
+    // Backlog = MAX_PEERS + 2 (mały zapas żeby kernel kolejkował 3-ci connect
+    // attempt zanim go odrzucimy w acceptLoop).
+    if (listen(srv_sock_, (int)MAX_PEERS + 2) < 0) {
         LOG_ERR(std::string("bluetooth listen() failed: ") + std::strerror(errno));
         close(srv_sock_); srv_sock_ = -1;
         return false;
@@ -1867,48 +2078,85 @@ bool BluetoothServer::start(int channel) {
 
     running_ = true;
     accept_thr_ = std::thread(&BluetoothServer::acceptLoop, this);
-    send_thr_   = std::thread(&BluetoothServer::sendLoop,   this);
-    LOG_INFO("BluetoothServer listening on RFCOMM channel " + std::to_string(channel));
+    LOG_INFO("BluetoothServer listening on RFCOMM channel " +
+             std::to_string(channel) + " (max " +
+             std::to_string(MAX_PEERS) + " peers)");
     return true;
-}
-
-void BluetoothServer::closeClientLocked() {
-    int cs = cli_sock_.exchange(-1);
-    if (cs >= 0) {
-        ::shutdown(cs, SHUT_RDWR);
-        close(cs);
-    }
-    connected_ = false;
 }
 
 void BluetoothServer::stop() {
     running_ = false;
 
+    // Zamknij wszystkie peer sockets — to obudzi blokujące recv() w reader
+    // threadach. Sender threads zostaną wybudzone przez notify w pętli.
     {
-        std::lock_guard<std::mutex> g(sock_mu_);
-        closeClientLocked();
-        if (srv_sock_ >= 0) {
-            ::shutdown(srv_sock_, SHUT_RDWR);
-            close(srv_sock_);
-            srv_sock_ = -1;
+        std::lock_guard<std::mutex> g(peers_mu_);
+        for (auto& p : peers_) {
+            p->alive = false;
+            if (p->sock >= 0) {
+                ::shutdown(p->sock, SHUT_RDWR);
+                ::close(p->sock);
+                p->sock = -1;
+            }
+            p->out_cv.notify_all();
         }
+        peers_.clear(); // shared_ptr wciąż żyją w detached wątkach
     }
-    out_cv_.notify_all();
+
+    if (srv_sock_ >= 0) {
+        ::shutdown(srv_sock_, SHUT_RDWR);
+        ::close(srv_sock_);
+        srv_sock_ = -1;
+    }
 
     if (accept_thr_.joinable()) accept_thr_.join();
-    if (send_thr_.joinable())   send_thr_.join();
+
+    // Wymaganie #1: zapomnij sparowane urządzenia przy shutdown.
+    forgetAllPairedDevices();
 }
+
+void BluetoothServer::pushInEvent(std::string line, int peer_id) {
+    std::lock_guard<std::mutex> g(in_mu_);
+    if (in_queue_.size() >= BT_QUEUE_MAX) in_queue_.pop_front();
+    in_queue_.push_back({std::move(line), peer_id});
+}
+
+// ── Accept loop ────────────────────────────────────────────────────────────
 
 void BluetoothServer::acceptLoop() {
     while (running_.load()) {
         sockaddr_rc rem{};
-        socklen_t len = sizeof(rem);
-        int cs = accept(srv_sock_, (sockaddr*)&rem, &len);
+        socklen_t   len = sizeof(rem);
+        int         cs  = accept(srv_sock_, (sockaddr*)&rem, &len);
         if (cs < 0) {
             if (!running_) return;
             LOG_WARN(std::string("bluetooth accept() failed: ") + std::strerror(errno));
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;
+        }
+
+        // Sprawdź limit peerów (z lockiem). Reaper: usuń dead peery najpierw.
+        std::shared_ptr<BtPeer> peer;
+        {
+            std::lock_guard<std::mutex> g(peers_mu_);
+            peers_.erase(std::remove_if(peers_.begin(), peers_.end(),
+                [](const std::shared_ptr<BtPeer>& p){ return !p->alive.load(); }),
+                peers_.end());
+
+            if (peers_.size() >= MAX_PEERS) {
+                LOG_WARN("BT: max peers (" + std::to_string(MAX_PEERS) +
+                         ") osiągnięte — odrzucam nowe połączenie");
+                ::close(cs);
+                continue;
+            }
+
+            peer       = std::make_shared<BtPeer>();
+            peer->id   = next_peer_id_.fetch_add(1);
+            peer->sock = cs;
+            char addrbuf[18] = {0};
+            ba2str(&rem.rc_bdaddr, addrbuf);
+            peer->addr = addrbuf;
+            peers_.push_back(peer);
         }
 
         struct timeval tv_send{BT_SEND_TIMEOUT_MS / 1000,
@@ -1917,135 +2165,194 @@ void BluetoothServer::acceptLoop() {
         struct timeval tv_recv{30, 0};
         setsockopt(cs, SOL_SOCKET, SO_RCVTIMEO, &tv_recv, sizeof(tv_recv));
 
-        {
-            std::lock_guard<std::mutex> g(sock_mu_);
-            cli_sock_.store(cs);
-        }
-        connected_ = true;
+        LOG_INFO("BT peer " + std::to_string(peer->id) +
+                 " connected from " + peer->addr +
+                 " (" + std::to_string(connected_count()) + "/" +
+                 std::to_string(MAX_PEERS) + ")");
 
-        {
-            std::lock_guard<std::mutex> g(in_mu_);
-            in_queue_.push_back("__BT_CONNECTED__");
-            if (in_queue_.size() > BT_QUEUE_MAX) in_queue_.pop_front();
-        }
-        out_cv_.notify_all();
+        // System event do kolejki — handleBluetoothCommand użyje peer_id do
+        // wysłania initial sync (sendFullSync) tylko do tego peera.
+        pushInEvent("__BT_CONNECTED__", peer->id);
 
-        char buf[1024];
-        while (running_.load()) {
-            int n = recv(cs, buf, sizeof(buf) - 1, 0);
-            if (n == 0) break;
-            if (n < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                if (errno == EINTR) continue;
-                break;
-            }
-
-            if (recv_buffer_.size() + (size_t)n > BT_RECV_BUFFER_MAX) {
-                LOG_WARN("BT recv_buffer overflow — czyszczenie");
-                recv_buffer_.clear();
-            }
-            recv_buffer_.append(buf, n);
-
-            size_t pos;
-            while ((pos = recv_buffer_.find('\n')) != std::string::npos) {
-                std::string line = recv_buffer_.substr(0, pos);
-                recv_buffer_.erase(0, pos + 1);
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                if (line.size() > BT_LINE_MAX) {
-                    LOG_WARN("BT line too long — odrzucam");
-                    continue;
-                }
-                if (!line.empty()) {
-                    std::lock_guard<std::mutex> g(in_mu_);
-                    if (in_queue_.size() < BT_QUEUE_MAX) {
-                        in_queue_.push_back(std::move(line));
-                    } else {
-                        LOG_WARN("BT in_queue full — drop");
-                    }
-                }
-            }
-        }
-
-        {
-            std::lock_guard<std::mutex> g(sock_mu_);
-            closeClientLocked();
-        }
-        recv_buffer_.clear();
-        {
-            std::lock_guard<std::mutex> g(in_mu_);
-            in_queue_.push_back("__BT_DISCONNECTED__");
-            if (in_queue_.size() > BT_QUEUE_MAX) in_queue_.pop_front();
-        }
-        out_cv_.notify_all();
+        // Reader + sender — detached. shared_ptr<BtPeer> trzyma struct przy
+        // życiu dopóki oba wątki działają.
+        std::thread(&BluetoothServer::readerLoop, this, peer).detach();
+        std::thread(&BluetoothServer::senderLoop, this, peer).detach();
     }
 }
 
-void BluetoothServer::sendLoop() {
-    while (running_.load()) {
-        std::string msg;
-        {
-            std::unique_lock<std::mutex> g(out_mu_);
-            out_cv_.wait(g, [&]{ return !running_.load() || !out_queue_.empty(); });
-            if (!running_.load() && out_queue_.empty()) return;
-            if (out_queue_.empty()) continue;
-            msg = std::move(out_queue_.front());
-            out_queue_.pop_front();
+// ── Per-peer reader ────────────────────────────────────────────────────────
+
+void BluetoothServer::readerLoop(std::shared_ptr<BtPeer> peer) {
+    char buf[1024];
+    while (running_.load() && peer->alive.load()) {
+        int sock = peer->sock;
+        if (sock < 0) break;
+        int n = recv(sock, buf, sizeof(buf) - 1, 0);
+        if (n == 0) break; // peer disconnected
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+            break;
         }
 
-        int cs = cli_sock_.load();
-        if (cs < 0) continue;
+        if (peer->recv_buffer.size() + (size_t)n > BT_RECV_BUFFER_MAX) {
+            LOG_WARN("BT peer " + std::to_string(peer->id) +
+                     " recv_buffer overflow — czyszczę");
+            peer->recv_buffer.clear();
+        }
+        peer->recv_buffer.append(buf, n);
+
+        size_t pos;
+        while ((pos = peer->recv_buffer.find('\n')) != std::string::npos) {
+            std::string line = peer->recv_buffer.substr(0, pos);
+            peer->recv_buffer.erase(0, pos + 1);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.size() > BT_LINE_MAX) {
+                LOG_WARN("BT peer " + std::to_string(peer->id) +
+                         " line too long — odrzucam");
+                continue;
+            }
+            if (!line.empty()) pushInEvent(std::move(line), peer->id);
+        }
+    }
+
+    // Cleanup: oznacz peer jako dead, usuń socket, notify sender żeby się obudził.
+    peer->alive = false;
+    if (peer->sock >= 0) {
+        ::shutdown(peer->sock, SHUT_RDWR);
+        ::close(peer->sock);
+        peer->sock = -1;
+    }
+    peer->out_cv.notify_all();
+    {
+        std::lock_guard<std::mutex> g(peers_mu_);
+        peers_.erase(std::remove_if(peers_.begin(), peers_.end(),
+            [pid = peer->id](const std::shared_ptr<BtPeer>& p){ return p->id == pid; }),
+            peers_.end());
+    }
+    pushInEvent("__BT_DISCONNECTED__", peer->id);
+    LOG_INFO("BT peer " + std::to_string(peer->id) + " disconnected (" +
+             std::to_string(connected_count()) + "/" +
+             std::to_string(MAX_PEERS) + ")");
+}
+
+// ── Per-peer sender ────────────────────────────────────────────────────────
+
+void BluetoothServer::senderLoop(std::shared_ptr<BtPeer> peer) {
+    while (running_.load() && peer->alive.load()) {
+        std::string msg;
+        {
+            std::unique_lock<std::mutex> g(peer->out_mu);
+            peer->out_cv.wait(g, [&]{
+                return !running_.load() || !peer->alive.load() || !peer->out_queue.empty();
+            });
+            if (!peer->alive.load() || !running_.load()) return;
+            if (peer->out_queue.empty()) continue;
+            msg = std::move(peer->out_queue.front());
+            peer->out_queue.pop_front();
+        }
+
+        int sock = peer->sock;
+        if (sock < 0) return;
 
         if (msg.empty() || msg.back() != '\n') msg.push_back('\n');
 
-        ssize_t off = 0;
-        bool failed = false;
+        ssize_t off    = 0;
+        bool    failed = false;
         while (off < (ssize_t)msg.size()) {
-            ssize_t n = send(cs, msg.data() + off, msg.size() - off, MSG_NOSIGNAL);
+            ssize_t n = send(sock, msg.data() + off, msg.size() - off, MSG_NOSIGNAL);
             if (n <= 0) {
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    LOG_WARN("BT send timeout — klient nieresponsywny, zamykam");
-                } else {
-                    LOG_WARN("BT send error: " + std::string(std::strerror(errno)));
-                }
+                LOG_WARN("BT peer " + std::to_string(peer->id) +
+                         " send error: " + std::string(std::strerror(errno)));
                 failed = true;
                 break;
             }
             off += n;
         }
-
         if (failed) {
-            std::lock_guard<std::mutex> g(sock_mu_);
-            closeClientLocked();
+            peer->alive = false;
+            if (peer->sock >= 0) {
+                ::shutdown(peer->sock, SHUT_RDWR);
+                ::close(peer->sock);
+                peer->sock = -1;
+            }
+            // reader wykryje shutdown, doda __BT_DISCONNECTED__ + zdejmie z peers_
+            return;
         }
     }
 }
 
-bool BluetoothServer::pop_line(std::string& out) {
+// ── Input ─────────────────────────────────────────────────────────────────
+
+bool BluetoothServer::pop_line(std::string& out, int& src_peer_id) {
     std::lock_guard<std::mutex> g(in_mu_);
     if (in_queue_.empty()) return false;
-    out = std::move(in_queue_.front());
+    out         = std::move(in_queue_.front().line);
+    src_peer_id = in_queue_.front().peer_id;
     in_queue_.pop_front();
     return true;
 }
 
-void BluetoothServer::send_line(const std::string& line) {
-    if (!is_connected()) return;
-    {
-        std::lock_guard<std::mutex> g(out_mu_);
-        if (out_queue_.size() >= BT_SEND_QUEUE_MAX) {
-            for (auto it = out_queue_.begin(); it != out_queue_.end();) {
-                if (it->rfind("CLOCK|", 0) == 0) it = out_queue_.erase(it);
-                else ++it;
-                if (out_queue_.size() < BT_SEND_QUEUE_MAX / 2) break;
-            }
-            if (out_queue_.size() >= BT_SEND_QUEUE_MAX) {
-                LOG_WARN("BT out_queue full — dropping line");
-                return;
-            }
+int BluetoothServer::connected_count() const {
+    std::lock_guard<std::mutex> g(peers_mu_);
+    int n = 0;
+    for (const auto& p : peers_) if (p->alive.load()) n++;
+    return n;
+}
+
+// ── Output ────────────────────────────────────────────────────────────────
+
+void BluetoothServer::enqueueToPeer(BtPeer& peer, const std::string& line) {
+    std::lock_guard<std::mutex> g(peer.out_mu);
+    if (peer.out_queue.size() >= BT_SEND_QUEUE_MAX) {
+        // Drop najstarsze CLOCK|... messages (są ulotne, kolejny CLOCK przyjdzie
+        // za 500 ms). Inne komunikaty zachowujemy.
+        for (auto it = peer.out_queue.begin(); it != peer.out_queue.end();) {
+            if (it->rfind("CLOCK|", 0) == 0) it = peer.out_queue.erase(it);
+            else ++it;
+            if (peer.out_queue.size() < BT_SEND_QUEUE_MAX / 2) break;
         }
-        out_queue_.push_back(line);
+        if (peer.out_queue.size() >= BT_SEND_QUEUE_MAX) {
+            LOG_WARN("BT peer " + std::to_string(peer.id) +
+                     " out_queue full — dropping line");
+            return;
+        }
     }
-    out_cv_.notify_one();
+    peer.out_queue.push_back(line);
+    peer.out_cv.notify_one();
+}
+
+int BluetoothServer::send_line(const std::string& line) {
+    std::lock_guard<std::mutex> g(peers_mu_);
+    int n = 0;
+    for (auto& p : peers_) {
+        if (!p->alive.load()) continue;
+        enqueueToPeer(*p, line);
+        n++;
+    }
+    return n;
+}
+
+int BluetoothServer::send_line_to(int peer_id, const std::string& line) {
+    std::lock_guard<std::mutex> g(peers_mu_);
+    for (auto& p : peers_) {
+        if (p->id == peer_id && p->alive.load()) {
+            enqueueToPeer(*p, line);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int BluetoothServer::send_line_except(int except_peer_id, const std::string& line) {
+    std::lock_guard<std::mutex> g(peers_mu_);
+    int n = 0;
+    for (auto& p : peers_) {
+        if (!p->alive.load() || p->id == except_peer_id) continue;
+        enqueueToPeer(*p, line);
+        n++;
+    }
+    return n;
 }
 
 // ─── Event handlers ─────────────────────────────────────────────────────────
@@ -2102,6 +2409,13 @@ static void handle_setup_events(ClockState* c, AppResources* a,
     if (x >= 920 && x < 960 && y >= 60 && y < 95) { if (a->setup_increment < 30) a->setup_increment++; return; }
     
     if (x >= 340 && x <= 640 && y >= 130 && y <= 200) {
+        // Wymaganie #1: blokuj START dopóki nie podłączą się 2 tablety.
+        if (a->bt_peer_count < a->bt_peer_max) {
+            LOG_INFO("START click ignored — only " +
+                     std::to_string(a->bt_peer_count) + "/" +
+                     std::to_string(a->bt_peer_max) + " tablets connected");
+            return;
+        }
         uint32_t start_ms = a->setup_minutes * 60 * 1000;
         uint32_t inc_ms   = a->setup_increment * 1000;
         init_clock(c, start_ms, inc_ms);
@@ -2187,7 +2501,9 @@ static void handle_game_events(ClockState* c, AppResources* a, ApiClient* api,
             std::string uci = c->pending_uci;
             c->pending_uci.clear();
             sess.pendingName.clear();
-            tryMove(sess, *a, *c, bt, *api, -1, uci, true); 
+            // src_peer_id = -1 (commit z UI zegara, nie od konkretnego tabletu).
+            // tryMove broadcastuje wynik do obu tabletów.
+            tryMove(sess, *a, *c, bt, *api, /*src_peer_id*/-1, -1, uci, true);
         } else {
             switch_side(c, side);
         }
@@ -2443,6 +2759,15 @@ static void startNewGame(Session& sess, AppResources& app, ClockState& cs,
                          BluetoothServer& bt, ApiClient& api,
                          const std::string& white, const std::string& black,
                          int minutes, int incSec) {
+    // Wymaganie #1: nie pozwól startować bez 2 podłączonych tabletów (gdy
+    // sieciowo gramy). Lokalny "solo" run zawsze dopuszczalny.
+    if (sess.networked && bt.connected_count() < (int)BluetoothServer::MAX_PEERS) {
+        bt.send_line("ERR|need_two_tablets|" + std::to_string(bt.connected_count()) +
+                     "/" + std::to_string(BluetoothServer::MAX_PEERS));
+        LOG_WARN("startNewGame zablokowane — connected_count=" +
+                 std::to_string(bt.connected_count()));
+        return;
+    }
     sess.whiteName = white.empty() ? "White" : white;
     sess.blackName = black.empty() ? "Black" : black;
     sess.moveHistory.clear();
@@ -2497,44 +2822,57 @@ static bool normalizeUci(std::string& uci) {
     return true;
 }
 
+// tryMove — src_peer_id wskazuje peera od którego przyszedł ruch:
+//   * błędy / DUP / ACK lecą TYLKO do source (`send_line_to`)
+//   * po udanym ruchu broadcast `MOVE|...` leci do POZOSTAŁYCH peerów
+//     (`send_line_except`), tak żeby druga szachownica się zsynchronizowała.
+//   * GAME_OVER + retransmit lecą do wszystkich (broadcast — oba tablety
+//     mają zobaczyć koniec partii).
+// src_peer_id == -1 → wywołanie lokalne (np. CHESS_COMMIT z UI zegara) →
+// w takim razie wszystkie wiadomości lecą jako broadcast (nie ma "source").
 static void tryMove(Session& sess, AppResources& /*app*/, ClockState& cs,
                     BluetoothServer& bt, ApiClient& api,
-                    int seq, std::string uciStr, bool is_commit) {
-    if (sess.over) { bt.send_line("ERR|game_over"); return; }
+                    int src_peer_id, int seq, std::string uciStr, bool is_commit) {
+    auto reply = [&](const std::string& msg) {
+        if (src_peer_id > 0) bt.send_line_to(src_peer_id, msg);
+        else                 bt.send_line(msg);
+    };
+
+    if (sess.over) { reply("ERR|game_over"); return; }
 
     if (!normalizeUci(uciStr)) {
-        bt.send_line("ERR|bad_format|" + uciStr);
+        reply("ERR|bad_format|" + uciStr);
         return;
     }
 
     if (seq >= 0 && seq == sess.lastAcceptedSeq) {
-        bt.send_line("DUP|" + uciStr);
+        reply("DUP|" + uciStr);
         return;
     }
     if (!sess.lastAcceptedUci.empty() && sess.lastAcceptedUci == uciStr) {
-        bt.send_line("DUP|" + uciStr);
+        reply("DUP|" + uciStr);
         return;
     }
 
     try {
         Movelist moves;
         movegen::legalmoves(moves, sess.board);
-        if (moves.size() == 0) { bt.send_line("ERR|no_legal_moves"); return; }
+        if (moves.size() == 0) { reply("ERR|no_legal_moves"); return; }
 
         bool isWhiteTurn = (sess.board.sideToMove() == Color::WHITE);
 
         Move m;
         try { m = uci::uciToMove(sess.board, uciStr); }
-        catch (...) { bt.send_line("ERR|bad_format|" + uciStr); return; }
+        catch (...) { reply("ERR|bad_format|" + uciStr); return; }
 
         bool legal = false;
         for (auto mv : moves) if (uci::moveToUci(mv) == uciStr) { legal = true; break; }
-        if (!legal) { bt.send_line("ERR|illegal_move|" + uciStr); return; }
+        if (!legal) { reply("ERR|illegal_move|" + uciStr); return; }
 
         sess.board.makeMove(m);
-        
+
         cs.pending_uci.clear();
-        
+
         sess.moveHistory.push_back(uciStr);
         sess.lastAcceptedSeq = seq;
         sess.lastAcceptedUci = uciStr;
@@ -2547,11 +2885,24 @@ static void tryMove(Session& sess, AppResources& /*app*/, ClockState& cs,
         std::string playerColor = isWhiteTurn ? "White" : "Black";
         if (sess.networked)
             api.enqueueMove(uciStr, playerColor, sess.tcEnabled ? timeLeftMs : 0);
-            
+
+        // Echo do sender peera (jak dzisiaj — żeby tablet wiedział że ruch
+        // przyjęty). is_commit ma własny format używany przez CHESS_PROPOSE flow.
         if (is_commit) {
-            bt.send_line("CHESS_CLOCK_COMMIT");
+            reply("CHESS_CLOCK_COMMIT");
         } else {
-            bt.send_line(uciStr);
+            reply(uciStr);
+        }
+
+        // Forwarding do drugiego tabletu (wymaganie #2) — żeby jego
+        // szachownica też wiedziała o ruchu. seq w formacie "MOVE|seq|uci"
+        // pozwala tabletowi deduplikować jeśli sam by go zobaczył (ale i tak
+        // przesyłamy tylko legalne ruchy, więc duplikat byłby rzadkością).
+        if (src_peer_id > 0) {
+            std::ostringstream fwd;
+            fwd << "MOVE|" << (seq >= 0 ? std::to_string(seq) : "0")
+                << "|" << uciStr;
+            bt.send_line_except(src_peer_id, fwd.str());
         }
 
         Movelist next;
@@ -2570,16 +2921,18 @@ static void tryMove(Session& sess, AppResources& /*app*/, ClockState& cs,
             }
             sess.over = true;
             if (sess.networked) api.enqueueStatus(status, winner);
+            // GAME_OVER broadcast — oba tablety muszą wiedzieć (send_with_ack
+            // używa bt.send_line który jest broadcastem).
             send_with_ack(bt, sess, "game_over",
                           "GAME_OVER|" + winner + "|" + status);
             LOG_INFO("Game over: winner=" + winner + " status=" + status);
         }
     } catch (const std::exception& e) {
         LOG_ERR(std::string("tryMove exception: ") + e.what());
-        bt.send_line("ERR|engine_exception");
+        reply("ERR|engine_exception");
     } catch (...) {
         LOG_ERR("tryMove unknown exception");
-        bt.send_line("ERR|engine_exception");
+        reply("ERR|engine_exception");
     }
 }
 
@@ -2596,35 +2949,42 @@ static void checkTimeout(Session& sess, ClockState& cs, BluetoothServer& bt,
     LOG_INFO("Timeout: winner=" + winner);
 }
 
-static void sendFullSync(BluetoothServer& bt, const Session& sess, const ClockState& cs) {
-    bt.send_line("SYNC_BEGIN");
+// sendFullSync — wyślij snapshot do KONKRETNEGO peera. target_peer_id == -1
+// oznacza broadcast (legacy callers / SYNC_REQUEST bez kontekstu peera).
+static void sendFullSync(BluetoothServer& bt, int target_peer_id,
+                         const Session& sess, const ClockState& cs) {
+    auto out = [&](const std::string& line) {
+        if (target_peer_id > 0) bt.send_line_to(target_peer_id, line);
+        else                    bt.send_line(line);
+    };
+    out("SYNC_BEGIN");
     {
         std::ostringstream os;
         os << "SYNC_GAME|" << sess.whiteName << "|" << sess.blackName
            << "|" << sess.setupMinutes << "|" << sess.setupIncrement;
-        bt.send_line(os.str());
+        out(os.str());
     }
     {
         std::ostringstream os;
         os << "SYNC_CLOCK|" << cs.left.remaining_ms << "|" << cs.right.remaining_ms
            << "|" << (cs.active == ACTIVE_LEFT ? "white" : "black")
            << "|" << (int)cs.state;
-        bt.send_line(os.str());
+        out(os.str());
     }
     {
         std::ostringstream os;
         os << "SYNC_HISTORY|" << sess.moveHistory.size();
-        bt.send_line(os.str());
+        out(os.str());
     }
     int idx = 0;
     for (const auto& mv : sess.moveHistory) {
         std::ostringstream os;
         os << "SYNC_MOVE|" << idx++ << "|" << mv;
-        bt.send_line(os.str());
+        out(os.str());
     }
-    bt.send_line("SYNC_END");
-    LOG_INFO("Sent SYNC snapshot (history=" +
-             std::to_string(sess.moveHistory.size()) + " moves)");
+    out("SYNC_END");
+    LOG_INFO("Sent SYNC snapshot to peer " + std::to_string(target_peer_id) +
+             " (history=" + std::to_string(sess.moveHistory.size()) + " moves)");
 }
 
 static bool isUci(const std::string& s) {
@@ -2640,23 +3000,54 @@ static bool isUci(const std::string& s) {
     return true;
 }
 
-static void handleBluetoothCommand(const std::string& line,
+static void handleBluetoothCommand(const std::string& line, int src_peer_id,
                                    Session& sess, AppResources& app,
                                    ClockState& cs, BluetoothServer& bt,
                                    ApiClient& api) {
+    // Helper — odpowiedzi do KONKRETNEGO source peera (nie broadcast).
+    // Jeśli src_peer_id == -1 (np. lokalne wywołanie) — broadcast.
+    auto reply = [&](const std::string& msg) {
+        if (src_peer_id > 0) bt.send_line_to(src_peer_id, msg);
+        else                 bt.send_line(msg);
+    };
+
     if (line == "__BT_CONNECTED__") {
-        app.bt_status = "Telefon polaczony. Oczekiwanie na NEWGAME...";
+        int cnt = bt.connected_count();
+        if (cnt < (int)BluetoothServer::MAX_PEERS) {
+            app.bt_status = "Oczekiwanie na tablety... (" +
+                            std::to_string(cnt) + "/" +
+                            std::to_string(BluetoothServer::MAX_PEERS) + ")";
+        } else {
+            app.bt_status = "Gotowe — oba tablety podlaczone.";
+        }
         if (app.mode == UI_MODE_QR) app.mode = UI_MODE_SETUP;
-        bt.send_line("HELLO|chess_clock_pi");
+        // Powitanie + initial sync TYLKO do nowego peera.
+        bt.send_line_to(src_peer_id, "HELLO|chess_clock_pi");
+        // Jeśli partia już trwa (są ruchy w historii LUB stan != PAUSED na
+        // świeżo zresetowanym zegarze), wyślij snapshot do peera żeby jego
+        // szachownica się zsynchronizowała. To załatwia case: tablet B dołącza
+        // mid-game po tym jak tablet A już zagrał kilka ruchów.
+        if (!sess.moveHistory.empty()) {
+            sendFullSync(bt, src_peer_id, sess, cs);
+        }
         if (sess.awaiting_ack) {
             sess.ack_last_sent_ms = SDL_GetTicks() - ACK_TIMEOUT_MS;
         }
-        LOG_INFO("Bluetooth client connected");
+        LOG_INFO("Bluetooth peer " + std::to_string(src_peer_id) +
+                 " connected (count " + std::to_string(cnt) + ")");
         return;
     }
     if (line == "__BT_DISCONNECTED__") {
-        app.bt_status = "Telefon rozlaczony. Czekam ponownie...";
-        LOG_INFO("Bluetooth client disconnected");
+        int cnt = bt.connected_count();
+        if (cnt == 0) {
+            app.bt_status = "Brak tabletow. Wlacz Bluetooth i znajdz 'Chess-Clock-Pi'.";
+        } else {
+            app.bt_status = "Tablet odlaczony — czekam na powrot (" +
+                            std::to_string(cnt) + "/" +
+                            std::to_string(BluetoothServer::MAX_PEERS) + ")";
+        }
+        LOG_INFO("Bluetooth peer " + std::to_string(src_peer_id) +
+                 " disconnected (count " + std::to_string(cnt) + ")");
         return;
     }
 
@@ -2666,11 +3057,11 @@ static void handleBluetoothCommand(const std::string& line,
     const std::string& cmd = parts[0];
 
     if (isUci(cmd)) {
-        tryMove(sess, app, cs, bt, api, -1, cmd, false);
+        tryMove(sess, app, cs, bt, api, src_peer_id, -1, cmd, false);
         return;
     }
 
-    if (cmd == "HELLO")  { bt.send_line("OK|hello"); return; }
+    if (cmd == "HELLO")  { reply("OK|hello"); return; }
 
     if (cmd == "CHESS_PROPOSE") {
         if (parts.size() >= 4) {
@@ -2682,20 +3073,21 @@ static void handleBluetoothCommand(const std::string& line,
 
     if (cmd == "ACK") {
         if (parts.size() >= 2 && sess.awaiting_ack && parts[1] == sess.ack_context) {
-            LOG_INFO("Received ACK for context=" + parts[1]);
+            LOG_INFO("Received ACK for context=" + parts[1] +
+                     " from peer " + std::to_string(src_peer_id));
             clear_ack(sess);
         }
         return;
     }
 
-    if (cmd == "SYNC_REQUEST") { sendFullSync(bt, sess, cs); return; }
+    if (cmd == "SYNC_REQUEST") { sendFullSync(bt, src_peer_id, sess, cs); return; }
 
     if (cmd == "PAUSE") {
         GameState before = cs.state;
         pause_resume_clock(&cs);
         if (cs.state != before)
             api.enqueueArbiter(cs.state == STATE_RUNNING ? "resume" : "pause", 0);
-        bt.send_line("OK|pause");
+        bt.send_line("OK|pause"); // broadcast — oba tablety widzą pauzę
         return;
     }
     if (cmd == "RESUME") {
@@ -2718,7 +3110,7 @@ static void handleBluetoothCommand(const std::string& line,
         clear_ack(sess);
         resetBoardSafe(sess.board);
         api.enqueueArbiter("reset", 0);
-        bt.send_line("OK|reset");
+        bt.send_line("OK|reset"); // broadcast — oba tablety mają zresetować board
         return;
     }
     if (cmd == "ARBITER_STOP") {
@@ -2733,7 +3125,7 @@ static void handleBluetoothCommand(const std::string& line,
         bt.send_line("OK|arbiter_resume");
         return;
     }
-    if (cmd == "QUIT") { bt.send_line("OK|quit"); return; }
+    if (cmd == "QUIT") { reply("OK|quit"); return; }
 
     if (cmd == "NEWGAME") {
         std::string w = parts.size() > 1 ? parts[1] : "White";
@@ -2745,7 +3137,7 @@ static void handleBluetoothCommand(const std::string& line,
     }
 
     if (cmd == "MOVE") {
-        if (parts.size() < 2) { bt.send_line("ERR|move_requires_uci"); return; }
+        if (parts.size() < 2) { reply("ERR|move_requires_uci"); return; }
         int seq = -1;
         std::string uciStr;
         if (parts.size() >= 3 &&
@@ -2756,12 +3148,12 @@ static void handleBluetoothCommand(const std::string& line,
         } else {
             uciStr = parts[1];
         }
-        tryMove(sess, app, cs, bt, api, seq, uciStr, false);
+        tryMove(sess, app, cs, bt, api, src_peer_id, seq, uciStr, false);
         return;
     }
 
     if (cmd == "ERROR") {
-        if (parts.size() < 2) { bt.send_line("ERR|who?"); return; }
+        if (parts.size() < 2) { reply("ERR|who?"); return; }
         ActiveSide who = (parts[1] == "white" || parts[1] == "White") ? ACTIVE_LEFT : ACTIVE_RIGHT;
         player_error(&cs, who);
         api.enqueueArbiter(who == ACTIVE_LEFT ? "error_white" : "error_black", 0);
@@ -2770,7 +3162,7 @@ static void handleBluetoothCommand(const std::string& line,
     }
 
     if (cmd == "BONUS") {
-        if (parts.size() < 3) { bt.send_line("ERR|who?|ms?"); return; }
+        if (parts.size() < 3) { reply("ERR|who?|ms?"); return; }
         ActiveSide who = (parts[1] == "white" || parts[1] == "White") ? ACTIVE_LEFT : ACTIVE_RIGHT;
         uint32_t ms = (uint32_t)std::atoi(parts[2].c_str());
         add_bonus_time(&cs, who, ms);
@@ -2779,8 +3171,9 @@ static void handleBluetoothCommand(const std::string& line,
         return;
     }
 
-    bt.send_line("ERR|unknown_command|" + cmd);
-    LOG_WARN("Unknown BT command: " + cmd);
+    reply("ERR|unknown_command|" + cmd);
+    LOG_WARN("Unknown BT command from peer " +
+             std::to_string(src_peer_id) + ": " + cmd);
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -2952,6 +3345,7 @@ int main(int argc, char** argv) {
     bool bt_ok = bt.start(cfg.btChannel);
     if (bt_ok) app.bt_mac = bt.mac();
     else       app.bt_status = "Blad: nie mozna uruchomic serwera Bluetooth (uruchom jako root?)";
+    app.bt_peer_max = (int)BluetoothServer::MAX_PEERS;
 
     std::ostringstream payload;
     payload << "chessclock://" << app.bt_mac << "/" << app.bt_channel;
@@ -2995,8 +3389,9 @@ int main(int argc, char** argv) {
 
         std::string line;
         int processed = 0;
-        while (processed < BT_PER_FRAME_MAX && bt.pop_line(line)) {
-            handleBluetoothCommand(line, sess, app, cs, bt, api);
+        int src_peer = 0;
+        while (processed < BT_PER_FRAME_MAX && bt.pop_line(line, src_peer)) {
+            handleBluetoothCommand(line, src_peer, sess, app, cs, bt, api);
             processed++;
         }
 
@@ -3007,13 +3402,23 @@ int main(int argc, char** argv) {
         checkTimeout(sess, cs, bt, api);
         tick_ack(bt, sess);
 
-        if (bt.is_connected() && now - last_clock_push > 500) {
+        // Aktualizuj counter peerów dla UI (draw_setup_screen + gate START).
+        app.bt_peer_count = bt.connected_count();
+
+        if (now - last_clock_push > 500) {
             last_clock_push = now;
-            std::ostringstream os;
-            os << "CLOCK|" << cs.left.remaining_ms << "|" << cs.right.remaining_ms
-               << "|" << (cs.active == ACTIVE_LEFT ? "white" : "black")
-               << "|" << (int)cs.state;
-            bt.send_line(os.str());
+            // BT broadcast — gdy są podłączone tablety.
+            if (bt.is_connected()) {
+                std::ostringstream os;
+                os << "CLOCK|" << cs.left.remaining_ms << "|" << cs.right.remaining_ms
+                   << "|" << (cs.active == ACTIVE_LEFT ? "white" : "black")
+                   << "|" << (int)cs.state;
+                bt.send_line(os.str());
+            }
+            // Live push czasu na serwer (wymaganie #3) — jeżeli partia
+            // istnieje na serwerze (game_id ustawione przez sendNewGame).
+            // hbLoop sam wyśle co HB_INTERVAL_MS; tu tylko aktualizujemy cache.
+            api.enqueueHeartbeat(cs.left.remaining_ms, cs.right.remaining_ms);
         }
 
         update_overlay_state(app, cs);
