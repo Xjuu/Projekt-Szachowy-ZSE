@@ -425,6 +425,18 @@ struct AppResources {
     std::string   pair_status;         // komunikat statusu ("Sparowane: ...", "Błąd: ...")
     bool          pair_in_flight = false; // true gdy POST trwa, blokuje submit
     std::string   pair_session_label;  // co aktualnie zegar gra (np. "Zawody: Mistrzostwa")
+    // ── Oferta kodu dla arbitra (wymaganie #2) ──────────────────────────────
+    // Wypełniane co frame z ApiClient::offerView(). offer_ttl0 + offer_fetch_local_ms
+    // dają płynne odliczanie bez polegania na zegarze ściennym Pi vs serwer.
+    bool          offer_active   = false;
+    std::string   offer_code;
+    long long     offer_ttl0     = 0;     // sekundy do wygaśnięcia w chwili pobrania
+    uint32_t      offer_fetch_local_ms = 0;
+    long long     offer_server_now_seen = 0;
+    bool          offer_claimed  = false;
+    std::string   offer_target_kind;
+    std::string   offer_target_name;
+    long long     offer_table_no = 0;
 };
 
 struct Button {
@@ -574,6 +586,39 @@ static void draw_qr_screen(SDL_Renderer* r, AppResources* a) {
     if (!a->server_info.empty()) {
         blit_text(r, a->text_cache, a->font_small,
                   ("Serwer: " + a->server_info).c_str(), COLOR_FG, text_x, y); y += 22;
+    }
+
+    // Wymaganie #2 — panel kodu dla sędziego (prawy-górny róg). Niezaklejmowany:
+    // duży 6-cyfrowy kod + odliczanie do wygaśnięcia (10 min). Zaklejmowany:
+    // nazwa zawodów/meczu + numer stołu do weryfikacji.
+    if (a->offer_active) {
+        int ox = WINDOW_WIDTH - 400;
+        int oy = 66;
+        if (a->offer_claimed) {
+            blit_text(r, a->text_cache, a->font_small, "PODLACZONO:",
+                      SDL_Color{80, 200, 120, 255}, ox, oy); oy += 24;
+            blit_text(r, a->text_cache, a->font_medium,
+                      a->offer_target_name.c_str(), COLOR_FG, ox, oy); oy += 34;
+            char tb[48]; std::snprintf(tb, sizeof(tb), "STOL %lld", a->offer_table_no);
+            blit_text(r, a->text_cache, a->font_large, tb,
+                      SDL_Color{80, 200, 120, 255}, ox, oy); oy += 46;
+            blit_text(r, a->text_cache, a->font_small,
+                      "Zweryfikuj zawody/mecz.", COLOR_FG, ox, oy);
+        } else {
+            blit_text(r, a->text_cache, a->font_small, "KOD DLA SEDZIEGO:",
+                      COLOR_ACCENT, ox, oy); oy += 26;
+            blit_text(r, a->text_cache, a->font_xlarge,
+                      a->offer_code.c_str(), COLOR_FG, ox, oy); oy += 58;
+            long long elapsed   = ((long long)SDL_GetTicks() -
+                                   (long long)a->offer_fetch_local_ms) / 1000;
+            long long remaining = a->offer_ttl0 - elapsed;
+            if (remaining < 0) remaining = 0;
+            char cd[48];
+            std::snprintf(cd, sizeof(cd), "Wazny: %02d:%02d",
+                          (int)(remaining / 60), (int)(remaining % 60));
+            blit_text(r, a->text_cache, a->font_small, cd,
+                      SDL_Color{200, 150, 80, 255}, ox, oy);
+        }
     }
 
     blit_text(r, a->text_cache, a->font_small, a->bt_status.c_str(),
@@ -1409,6 +1454,165 @@ static std::string parseGameId(const std::string& response) {
     return response.substr(s, e - s);
 }
 
+// ─── JSON micro-parsery (wymaganie #2/#3) ───────────────────────────────────
+// jsonString/jsonInt z dołu pliku są zdefiniowane PO ApiClient, więc tutaj mamy
+// własne, lokalne wersje do parsowania odpowiedzi serwera w wątkach ApiClient.
+
+static std::string objStr(const std::string& j, const std::string& key) {
+    auto k = j.find("\"" + key + "\"");
+    if (k == std::string::npos) return "";
+    auto colon = j.find(':', k);
+    if (colon == std::string::npos) return "";
+    auto q1 = j.find('"', colon + 1);
+    if (q1 == std::string::npos) return "";
+    auto q2 = j.find('"', q1 + 1);
+    if (q2 == std::string::npos) return "";
+    return j.substr(q1 + 1, q2 - q1 - 1);
+}
+
+static long long objInt(const std::string& j, const std::string& key, long long fb) {
+    auto k = j.find("\"" + key + "\"");
+    if (k == std::string::npos) return fb;
+    auto colon = j.find(':', k);
+    if (colon == std::string::npos) return fb;
+    size_t s = colon + 1;
+    while (s < j.size() && (j[s]==' '||j[s]=='\t'||j[s]=='\n'||j[s]=='\r')) s++;
+    bool neg = false;
+    if (s < j.size() && j[s] == '-') { neg = true; s++; }
+    if (s >= j.size() || !std::isdigit((unsigned char)j[s])) return fb;
+    long long v = 0;
+    while (s < j.size() && std::isdigit((unsigned char)j[s])) { v = v*10 + (j[s]-'0'); s++; }
+    return neg ? -v : v;
+}
+
+static bool objBool(const std::string& j, const std::string& key) {
+    auto k = j.find("\"" + key + "\"");
+    if (k == std::string::npos) return false;
+    auto colon = j.find(':', k);
+    if (colon == std::string::npos) return false;
+    size_t s = colon + 1;
+    while (s < j.size() && (j[s]==' '||j[s]=='\t')) s++;
+    return j.compare(s, 4, "true") == 0;
+}
+
+// ServerClockCmd — komenda od serwera (sędzia w panelu arbitra). Pobierana
+// przez /clock/commands i stosowana lokalnie do ClockState + rozsyłana do tabletów.
+struct ServerClockCmd {
+    long long   id      = 0;
+    long long   game_id = 0;
+    std::string action;   // ADD | SUBTRACT | STOP | PLAY | FINISH | SET
+    std::string side;     // White | Black | ""
+    int         amount_ms = 0;
+    std::string reason;   // dla FINISH: White|Black|Draw
+};
+
+// parseClockCommands wyłuskuje tablicę "commands":[ {…}, … ] z odpowiedzi serwera.
+static std::vector<ServerClockCmd> parseClockCommands(const std::string& body) {
+    std::vector<ServerClockCmd> out;
+    auto cpos = body.find("\"commands\"");
+    if (cpos == std::string::npos) return out;
+    auto lb = body.find('[', cpos);
+    if (lb == std::string::npos) return out;
+    int depth = 0;
+    size_t objStart = std::string::npos;
+    for (size_t i = lb + 1; i < body.size(); ++i) {
+        char c = body[i];
+        if (c == '{') { if (depth == 0) objStart = i; depth++; }
+        else if (c == '}') {
+            if (depth > 0) depth--;
+            if (depth == 0 && objStart != std::string::npos) {
+                std::string obj = body.substr(objStart, i - objStart + 1);
+                ServerClockCmd cmd;
+                cmd.id        = objInt(obj, "id", 0);
+                cmd.game_id   = objInt(obj, "game_id", 0);
+                cmd.action    = objStr(obj, "action");
+                cmd.side      = objStr(obj, "side");
+                cmd.amount_ms = (int)objInt(obj, "amount_ms", 0);
+                cmd.reason    = objStr(obj, "reason");
+                if (!cmd.action.empty()) out.push_back(cmd);
+                objStart = std::string::npos;
+            }
+        } else if (c == ']' && depth == 0) {
+            break;
+        }
+    }
+    return out;
+}
+
+static std::vector<ServerClockCmd> apiFetchCommands(const std::string& ip, int port,
+        const std::string& clockCode, long long since,
+        std::atomic<bool>* abort_flag, long long* maxId) {
+    std::string path = "/clock/commands?since=" + std::to_string(since);
+    std::string resp = httpGet(ip, port, path, clockCode, "", abort_flag);
+    auto bp = resp.find("\r\n\r\n");
+    std::string body = (bp != std::string::npos) ? resp.substr(bp + 4) : resp;
+    auto cmds = parseClockCommands(body);
+    if (maxId) for (auto& c : cmds) if (c.id > *maxId) *maxId = c.id;
+    return cmds;
+}
+
+// Oferta kodu dla arbitra (wymaganie #2).
+struct OfferInfo {
+    bool        ok = false;
+    std::string code;
+    long long   expires_at = 0;
+    long long   server_now = 0;
+    std::string error;
+};
+
+static OfferInfo apiOfferCreate(const std::string& ip, int port,
+        const std::string& clockCode, std::atomic<bool>* abort_flag) {
+    OfferInfo r;
+    std::string resp = httpPost(ip, port, "/api/clock/offer", "{}", clockCode, "", abort_flag);
+    auto bp = resp.find("\r\n\r\n");
+    std::string body = (bp != std::string::npos) ? resp.substr(bp + 4) : resp;
+    if (!objBool(body, "ok")) {
+        r.error = objStr(body, "error");
+        if (r.error.empty()) r.error = "offer_failed";
+        return r;
+    }
+    r.ok = true;
+    r.code       = objStr(body, "code");
+    r.expires_at = objInt(body, "expires_at", 0);
+    r.server_now = objInt(body, "server_now", 0);
+    return r;
+}
+
+struct OfferStatusInfo {
+    bool        ok = false;
+    bool        has_offer = false;
+    bool        claimed = false;
+    bool        expired = false;
+    std::string code;
+    long long   expires_at = 0;
+    long long   server_now = 0;
+    std::string target_kind;
+    std::string target_name;
+    long long   table_no = 0;
+};
+
+static OfferStatusInfo apiOfferStatus(const std::string& ip, int port,
+        const std::string& clockCode, std::atomic<bool>* abort_flag) {
+    OfferStatusInfo r;
+    std::string resp = httpGet(ip, port, "/api/clock/offer/status", clockCode, "", abort_flag);
+    auto bp = resp.find("\r\n\r\n");
+    std::string body = (bp != std::string::npos) ? resp.substr(bp + 4) : resp;
+    if (!objBool(body, "ok")) return r;
+    r.ok         = true;
+    r.has_offer  = objBool(body, "has_offer");
+    r.claimed    = objBool(body, "claimed");
+    r.expired    = objBool(body, "expired");
+    r.code       = objStr(body, "code");
+    r.expires_at = objInt(body, "expires_at", 0);
+    r.server_now = objInt(body, "server_now", 0);
+    if (r.claimed) {
+        r.target_kind = objStr(body, "target_kind");
+        r.target_name = objStr(body, "target_name");
+        r.table_no    = objInt(body, "table_no", 0);
+    }
+    return r;
+}
+
 // ─── ApiClient ──────────────────────────────────────────────────────────────
 
 enum ApiKind {
@@ -1454,6 +1658,8 @@ public:
         thr_ = std::thread(&ApiClient::workerLoop, this);
         persist_thr_ = std::thread(&ApiClient::persistLoop, this);
         hb_thr_ = std::thread(&ApiClient::heartbeatLoop, this);
+        offer_thr_ = std::thread(&ApiClient::offerLoop, this);   // wymaganie #2
+        cmd_thr_   = std::thread(&ApiClient::commandLoop, this); // wymaganie #3
         LOG_INFO("ApiClient started (queue size=" + std::to_string(queue_.size()) +
                  ", heartbeat=" + std::to_string(HB_INTERVAL_MS) + "ms)");
     }
@@ -1470,6 +1676,8 @@ public:
         if (thr_.joinable()) thr_.join();
         if (persist_thr_.joinable()) persist_thr_.join();
         if (hb_thr_.joinable()) hb_thr_.join();
+        if (offer_thr_.joinable()) offer_thr_.join();
+        if (cmd_thr_.joinable()) cmd_thr_.join();
         persistQueueNow();
         LOG_INFO("ApiClient stopped (queue size=" + std::to_string(queue_.size()) + ")");
     }
@@ -1538,6 +1746,21 @@ public:
     void clearGameId() {
         std::lock_guard<std::mutex> g(idmu_);
         gameId_.clear();
+    }
+
+    // ── Oferta kodu dla arbitra (wymaganie #2) — snapshot do UI ──────────────
+    OfferStatusInfo offerView() {
+        std::lock_guard<std::mutex> g(offer_mu_);
+        return offer_;
+    }
+
+    // ── Komendy od serwera (wymaganie #3) — drenowane przez główną pętlę ─────
+    bool popServerCommand(ServerClockCmd& out) {
+        std::lock_guard<std::mutex> g(srv_cmd_mu_);
+        if (srv_cmd_queue_.empty()) return false;
+        out = srv_cmd_queue_.front();
+        srv_cmd_queue_.pop_front();
+        return true;
     }
 
 private:
@@ -1878,6 +2101,87 @@ private:
                            clockCode_, apiKey_, &abort_flag_);
         }
     }
+
+    // ── Wymaganie #2: pętla oferty kodu dla arbitra ──────────────────────────
+    // Na starcie generuje 6-cyfrowy kod (POST /api/clock/offer), potem co ~3 s
+    // sprawdza status (GET /api/clock/offer/status). Gdy kod wygaśnie nie będąc
+    // zaklejmowanym — generuje nowy. Gdy zostanie zaklejmowany — zapamiętuje
+    // cel + numer stołu (do weryfikacji na ekranie).
+    void offerLoop() {
+        if (!networked_) return;
+        auto nap = [&](int ms) {
+            for (int s = 0; s < ms && running_.load(); s += 50)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        };
+        nap(800);
+        bool need_new = true;
+        while (running_.load()) {
+            if (need_new) {
+                OfferInfo oi = apiOfferCreate(ip_, port_, clockCode_, &abort_flag_);
+                if (oi.ok) {
+                    std::lock_guard<std::mutex> g(offer_mu_);
+                    offer_ = OfferStatusInfo{};
+                    offer_.ok = true; offer_.has_offer = true;
+                    offer_.code       = oi.code;
+                    offer_.expires_at = oi.expires_at;
+                    offer_.server_now = oi.server_now;
+                    need_new = false;
+                    LOG_INFO("Offer code = " + oi.code + " (kod dla sedziego)");
+                } else {
+                    nap(3000);
+                    continue;
+                }
+            }
+            nap(3000);
+            if (!running_.load()) break;
+            OfferStatusInfo st = apiOfferStatus(ip_, port_, clockCode_, &abort_flag_);
+            if (st.ok && st.has_offer) {
+                { std::lock_guard<std::mutex> g(offer_mu_); offer_ = st; }
+                if (st.claimed)      nap(7000);
+                else if (st.expired) need_new = true;
+            } else if (st.ok && !st.has_offer) {
+                need_new = true;
+            }
+        }
+    }
+
+    // ── Wymaganie #3: pętla pobierania komend sędziego ───────────────────────
+    // Co 1.5 s pyta /clock/commands?since=N. Komendy dla NASZEGO game_id trafiają
+    // do kolejki, którą główna pętla drenuje i stosuje do ClockState + rozsyła
+    // do tabletów. Dopóki partia nie istnieje na serwerze (brak game_id) — czeka.
+    void commandLoop() {
+        if (!networked_) return;
+        auto nap = [&](int ms) {
+            for (int s = 0; s < ms && running_.load(); s += 50)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        };
+        while (running_.load()) {
+            nap(1500);
+            if (!running_.load()) break;
+            std::string gid = gameId();
+            if (gid.empty()) continue;
+            long long mygame = 0;
+            try { mygame = std::stoll(gid); } catch (...) { continue; }
+            long long since = cmd_since_.load();
+            long long maxId = since;
+            auto cmds = apiFetchCommands(ip_, port_, clockCode_, since, &abort_flag_, &maxId);
+            for (auto& c : cmds) {
+                if (c.game_id != mygame) continue;
+                std::lock_guard<std::mutex> g(srv_cmd_mu_);
+                if (srv_cmd_queue_.size() < 256) srv_cmd_queue_.push_back(c);
+            }
+            if (maxId > since) cmd_since_.store(maxId);
+        }
+    }
+
+    // Wymaganie #2/#3 — stan współdzielony z UI / główną pętlą.
+    std::thread                offer_thr_;
+    std::thread                cmd_thr_;
+    std::mutex                 offer_mu_;
+    OfferStatusInfo            offer_;
+    std::atomic<long long>     cmd_since_{0};
+    std::mutex                 srv_cmd_mu_;
+    std::deque<ServerClockCmd> srv_cmd_queue_;
 };
 
 static void reportArbiter(ApiClient* api, const std::string& action, long long valueMs) {
@@ -1932,6 +2236,12 @@ public:
     int         channel() const { return channel_; }
 
     static constexpr size_t MAX_PEERS = 2;
+
+    // Wymaganie #1: zegar jest wykrywalny TYLKO dopóki nie podłączą się oba
+    // tablety. Po komplecie wyłączamy inquiry scan (zostaje page scan, więc
+    // tablet który odpadł może się wciąż wpiąć z powrotem). Publiczne — main
+    // wywołuje przy __BT_CONNECTED__ / __BT_DISCONNECTED__.
+    void setDiscoverable(bool on);
 
 private:
     void acceptLoop();
@@ -1998,6 +2308,40 @@ void BluetoothServer::enableDiscoverable() {
             }
             system("hciconfig hci0 name 'Chess-Clock-Pi' >/dev/null 2>&1");
         }
+    }
+}
+
+void BluetoothServer::setDiscoverable(bool on) {
+    // on=true  → inquiry + page scan (widoczny w skanie + można się łączyć)
+    // on=false → tylko page scan (niewidoczny dla nowych, ale paired/known
+    //            urządzenie wciąż się połączy — potrzebne do reconnectu po dropie)
+    int dev_id = hci_get_route(nullptr);
+    if (dev_id >= 0) {
+        int hci_sock = hci_open_dev(dev_id);
+        if (hci_sock >= 0) {
+            uint8_t scan_enable = on ? (SCAN_INQUIRY | SCAN_PAGE) : SCAN_PAGE;
+            struct hci_request rq{};
+            rq.ogf    = OGF_HOST_CTL;
+            rq.ocf    = OCF_WRITE_SCAN_ENABLE;
+            rq.cparam = &scan_enable;
+            rq.clen   = sizeof(scan_enable);
+            uint8_t status = 0;
+            rq.rparam = &status;
+            rq.rlen   = sizeof(status);
+            if (hci_send_req(hci_sock, &rq, 1000) == 0 && status == 0) {
+                LOG_INFO(on ? "BT: discoverable ON (inquiry+page scan)"
+                            : "BT: discoverable OFF (komplet tabletów — tylko page scan)");
+                hci_close_dev(hci_sock);
+                return;
+            }
+            hci_close_dev(hci_sock);
+        }
+    }
+    // Fallback przez hciconfig.
+    if (system(on ? "hciconfig hci0 piscan >/dev/null 2>&1"
+                  : "hciconfig hci0 pscan  >/dev/null 2>&1") == 0) {
+        LOG_INFO(on ? "BT: discoverable ON (hciconfig piscan)"
+                    : "BT: discoverable OFF (hciconfig pscan)");
     }
 }
 
@@ -2807,6 +3151,14 @@ static void startNewGame(Session& sess, AppResources& app, ClockState& cs,
     } else {
         bt.send_line("OK|newgame|local");
     }
+    // Wymaganie #5 — jednoznaczny sygnał startu dla telefonów (oba przechodzą do
+    // ekranu partii). Zawiera nazwy i tempo, niezależnie od źródła startu.
+    {
+        std::ostringstream gs;
+        gs << "GAME_START|" << sess.whiteName << "|" << sess.blackName
+           << "|" << sess.setupMinutes << "|" << sess.setupIncrement;
+        bt.send_line(gs.str());
+    }
     LOG_INFO("New game: " + sess.whiteName + " vs " + sess.blackName +
              " tc=" + std::to_string(sess.startMs) + "ms inc=" +
              std::to_string(sess.setupIncrement) + "s");
@@ -3019,6 +3371,8 @@ static void handleBluetoothCommand(const std::string& line, int src_peer_id,
                             std::to_string(BluetoothServer::MAX_PEERS) + ")";
         } else {
             app.bt_status = "Gotowe — oba tablety podlaczone.";
+            // Wymaganie #1: komplet → przestań być wykrywalny (zostaje page scan).
+            bt.setDiscoverable(false);
         }
         if (app.mode == UI_MODE_QR) app.mode = UI_MODE_SETUP;
         // Powitanie + initial sync TYLKO do nowego peera.
@@ -3039,6 +3393,9 @@ static void handleBluetoothCommand(const std::string& line, int src_peer_id,
     }
     if (line == "__BT_DISCONNECTED__") {
         int cnt = bt.connected_count();
+        // Wymaganie #1: poniżej kompletu znów stań się wykrywalny, by brakujący
+        // (lub nowy) tablet mógł dołączyć.
+        bt.setDiscoverable(true);
         if (cnt == 0) {
             app.bt_status = "Brak tabletow. Wlacz Bluetooth i znajdz 'Chess-Clock-Pi'.";
         } else {
@@ -3171,9 +3528,70 @@ static void handleBluetoothCommand(const std::string& line, int src_peer_id,
         return;
     }
 
+    if (cmd == "PLAYER") {
+        // Wymaganie #5 — aplikacja telefonu zgłasza imię gracza dla swojego koloru.
+        // Zapamiętujemy nazwy i rozgłaszamy obu telefonom PLAYERS|white|black, żeby
+        // strona inicjująca (białe) mogła wysłać NEWGAME z obiema nazwami, a nazwy
+        // trafiły na serwer (sendNewGame). reply OK|player do nadawcy.
+        if (parts.size() >= 3) {
+            const std::string& color = parts[1];
+            const std::string& nm = parts[2];
+            if (color == "White" || color == "white")      sess.whiteName = nm;
+            else if (color == "Black" || color == "black") sess.blackName = nm;
+        }
+        bt.send_line("PLAYERS|" + sess.whiteName + "|" + sess.blackName);
+        reply("OK|player");
+        return;
+    }
+
     reply("ERR|unknown_command|" + cmd);
     LOG_WARN("Unknown BT command from peer " +
              std::to_string(src_peer_id) + ": " + cmd);
+}
+
+// applyServerCommand — wymaganie #3: stosuje komendę sędziego (z panelu arbitra,
+// dostarczoną przez serwer i /clock/commands) do lokalnego ClockState i rozsyła
+// efekt do obu tabletów. ADD/SUBTRACT/SET = korekta czasu; STOP/PLAY = zatrzymaj/
+// wznów; FINISH (reason = White|Black|Draw) = orzeczenie wygranej/remisu.
+static void applyServerCommand(const ServerClockCmd& c, Session& sess,
+                               ClockState& cs, BluetoothServer& bt) {
+    ActiveSide   side = (c.side == "Black" || c.side == "black") ? ACTIVE_RIGHT : ACTIVE_LEFT;
+    PlayerClock& pc   = (side == ACTIVE_LEFT) ? cs.left : cs.right;
+
+    if (c.action == "ADD") {
+        if (c.amount_ms > 0) add_bonus_time(&cs, side, (uint32_t)c.amount_ms);
+        bt.send_line("ARBITER|add|" + c.side + "|" + std::to_string(c.amount_ms));
+        LOG_INFO("Arbiter ADD " + c.side + " +" + std::to_string(c.amount_ms) + "ms");
+    } else if (c.action == "SUBTRACT") {
+        uint32_t dec = (uint32_t)(c.amount_ms > 0 ? c.amount_ms : 0);
+        pc.remaining_ms = (dec >= pc.remaining_ms) ? 0u : (pc.remaining_ms - dec);
+        bt.send_line("ARBITER|sub|" + c.side + "|" + std::to_string(c.amount_ms));
+        LOG_INFO("Arbiter SUBTRACT " + c.side + " -" + std::to_string(c.amount_ms) + "ms");
+    } else if (c.action == "SET") {
+        pc.remaining_ms = (uint32_t)(c.amount_ms > 0 ? c.amount_ms : 0);
+        bt.send_line("ARBITER|set|" + c.side + "|" + std::to_string(c.amount_ms));
+        LOG_INFO("Arbiter SET " + c.side + " =" + std::to_string(c.amount_ms) + "ms");
+    } else if (c.action == "STOP") {
+        stop_by_arbiter(&cs);
+        bt.send_line("OK|arbiter_stop");
+        LOG_INFO("Arbiter STOP");
+    } else if (c.action == "PLAY") {
+        resume_by_arbiter(&cs);
+        if (cs.state == STATE_PAUSED) cs.state = STATE_RUNNING;
+        bt.send_line("OK|arbiter_resume");
+        LOG_INFO("Arbiter PLAY");
+    } else if (c.action == "FINISH") {
+        std::string winner = c.reason; // White | Black | Draw
+        if (winner == "White")      cs.state = STATE_FINISHED_LEFT_WIN;
+        else if (winner == "Black") cs.state = STATE_FINISHED_RIGHT_WIN;
+        else { cs.state = STATE_FINISHED_DRAW; winner = "Draw"; }
+        cs.finish_reason = "arbiter";
+        sess.over = true;
+        send_with_ack(bt, sess, "game_over", "GAME_OVER|" + winner + "|arbiter");
+        LOG_INFO("Arbiter FINISH winner=" + winner);
+    } else {
+        LOG_WARN("Unknown server command action: " + c.action);
+    }
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -3395,6 +3813,14 @@ int main(int argc, char** argv) {
             processed++;
         }
 
+        // Wymaganie #3 — komendy sędziego pobrane z serwera (panel arbitra).
+        ServerClockCmd scmd;
+        int sprocessed = 0;
+        while (sprocessed < 32 && api.popServerCommand(scmd)) {
+            applyServerCommand(scmd, sess, cs, bt);
+            sprocessed++;
+        }
+
         uint32_t now   = SDL_GetTicks();
         uint32_t delta = now - prev_tick;
         prev_tick      = now;
@@ -3404,6 +3830,29 @@ int main(int argc, char** argv) {
 
         // Aktualizuj counter peerów dla UI (draw_setup_screen + gate START).
         app.bt_peer_count = bt.connected_count();
+
+        // Wymaganie #2 — snapshot oferty kodu do UI. ttl0/fetch_local odświeżamy
+        // tylko gdy serwer poda nowy server_now (między pollami odliczanie biegnie
+        // lokalnie po SDL_GetTicks, więc countdown jest płynny).
+        {
+            OfferStatusInfo ov = api.offerView();
+            if (ov.has_offer) {
+                if (ov.server_now != app.offer_server_now_seen) {
+                    app.offer_ttl0 = (ov.expires_at > ov.server_now)
+                                     ? (ov.expires_at - ov.server_now) : 0;
+                    app.offer_fetch_local_ms  = SDL_GetTicks();
+                    app.offer_server_now_seen = ov.server_now;
+                }
+                app.offer_active      = true;
+                app.offer_code        = ov.code;
+                app.offer_claimed     = ov.claimed;
+                app.offer_target_kind = ov.target_kind;
+                app.offer_target_name = ov.target_name;
+                app.offer_table_no    = ov.table_no;
+            } else {
+                app.offer_active = false;
+            }
+        }
 
         if (now - last_clock_push > 500) {
             last_clock_push = now;
