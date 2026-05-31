@@ -1,0 +1,7 @@
+{
+  "clock_code":  "CHS-XXXX-XXXX-XXXX",
+  "public_key":  "pk_...",
+  "private_key": "sk_...",
+  "server":      "192.168.1.101:443",
+  "bt_channel":  1
+}
