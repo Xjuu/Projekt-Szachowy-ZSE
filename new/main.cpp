@@ -644,6 +644,9 @@ static void draw_qr_screen(SDL_Renderer* r, AppResources* a) {
             std::snprintf(cd, sizeof(cd), "Wazny: %02d:%02d",
                           (int)(remaining / 60), (int)(remaining % 60));
             blit_text(r, a->text_cache, a->font_small, cd,
+                      SDL_Color{200, 150, 80, 255}, ox, oy); oy += 26;
+            blit_text(r, a->text_cache, a->font_small,
+                      "Dane partii czekaja, az sedzia wpisze kod.",
                       SDL_Color{200, 150, 80, 255}, ox, oy);
         }
     }
@@ -880,13 +883,22 @@ static void draw_arbiter_menu(SDL_Renderer* r, AppResources* a, const ClockState
     draw_colored_button(r, a->text_cache, a->font_small, &bonus_b,   COLOR_BUTTON_BONUS,       COLOR_BUTTON_BONUS_HOVER, false);
     draw_colored_button(r, a->text_cache, a->font_small, &close_btn, COLOR_BUTTON_STOP,        COLOR_BUTTON_STOP_HOVER,  false);
 
-    char info[64];
-    std::snprintf(info, sizeof(info), "B: %u bledy | C: %u bledy",
-                  c->left.error_count, c->right.error_count);
+    // Liczniki błędów + AKTUALNE czasy — natychmiastowy feedback, że np.
+    // +2MIN faktycznie zadziałało (bez wracania do ekranu gry).
+    char tb_w[16], tb_b[16];
+    format_time(c->left.remaining_ms,  tb_w, sizeof(tb_w), TIME_FORMAT_MM_SS);
+    format_time(c->right.remaining_ms, tb_b, sizeof(tb_b), TIME_FORMAT_MM_SS);
+    char info[96];
+    std::snprintf(info, sizeof(info), "B: %u bledy, %s | C: %u bledy, %s",
+                  c->left.error_count, tb_w, c->right.error_count, tb_b);
     blit_text(r, a->text_cache, a->font_small, info, COLOR_FG, 20, 270);
 }
 
 static bool init_sdl_and_ttf() {
+    // Ekran dotykowy Pi: wymuś syntetyczne zdarzenia myszy z dotyku — bez tego
+    // (zależnie od sterownika/wersji SDL) przyciski reagują tylko na fizyczną
+    // mysz, a dotyk generuje wyłącznie SDL_FINGERDOWN, którego nie obsługujemy.
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "1");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
         std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return false;
@@ -1743,8 +1755,20 @@ public:
     // (jednorazowa akcja na żądanie operatora), nie ma sensu kolejkować.
     PairResult pairWithCode(const std::string& code) {
         if (!networked_) return PairResult{false, "no_network", "", ""};
-        return apiPair(ip_, port_, clockCode_, code);
+        PairResult res = apiPair(ip_, port_, clockCode_, code);
+        // Wpisanie poprawnego kodu = zegar związany z sesją → odblokuj wysyłkę.
+        if (res.ok && !bound_.exchange(true)) {
+            LOG_INFO("Pairing ok — wysylka danych odblokowana");
+            qcv_.notify_all();
+        }
+        return res;
     }
+
+    // Wymaganie: zegar NIE wysyła danych partii na serwer, dopóki kod nie
+    // zostanie wpisany (kod oferty zaklejmowany przez sędziego w panelu LUB
+    // kod pairingu wpisany na zegarze). Dane czekają w kolejce i lecą po
+    // związaniu. true = wysyłka odblokowana.
+    bool bound() const { return bound_.load(); }
 
     // ── Heartbeat (live clock push) ────────────────────────────────────────
     // Nadpisuje cache najnowszych wartości. Wątek hbLoop_ co ~HB_INTERVAL_MS
@@ -1819,6 +1843,21 @@ private:
                 if (!running_.load() && queue_.empty()) return;
                 req = queue_.front();
                 queue_.pop_front();
+            }
+
+            // Dopóki kod nie został wpisany (bound_ == false) — NIC nie wysyłamy.
+            // Żądanie wraca na początek kolejki i czekamy; po związaniu cała
+            // kolejka leci na serwer w oryginalnej kolejności (zero utraty danych).
+            if (!bound_.load()) {
+                {
+                    std::lock_guard<std::mutex> g(qmu_);
+                    queue_.push_front(std::move(req));
+                }
+                std::unique_lock<std::mutex> g(qmu_);
+                qcv_.wait_for(g, std::chrono::milliseconds(500),
+                              [&]{ return !running_.load(); });
+                if (!running_.load()) return;
+                continue;
             }
 
             if (req.kind != K_NEWGAME && gameId().empty()) {
@@ -2075,6 +2114,9 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> abort_flag_{false};
     std::atomic<bool> dirty_{false};
+    // Gate wysyłki danych partii (patrz bound()). Ustawiane przez pairWithCode
+    // (kod wpisany na zegarze) lub offerLoop (kod zaklejmowany przez sędziego).
+    std::atomic<bool> bound_{false};
     std::mutex qmu_;
     std::condition_variable qcv_;
     std::mutex persist_mu_;
@@ -2113,6 +2155,7 @@ private:
                 have = hb_has_data_;
             }
             if (!have) continue;
+            if (!bound_.load()) continue; // kod nie wpisany → nie wysyłamy
 
             std::string gid = gameId();
             if (gid.empty()) continue; // partia jeszcze nieutworzona na serwerze
@@ -2163,8 +2206,17 @@ private:
             OfferStatusInfo st = apiOfferStatus(ip_, port_, clockCode_, &abort_flag_);
             if (st.ok && st.has_offer) {
                 { std::lock_guard<std::mutex> g(offer_mu_); offer_ = st; }
-                if (st.claimed)      nap(7000);
-                else if (st.expired) need_new = true;
+                if (st.claimed) {
+                    // Sędzia wpisał kod w panelu → zegar związany z zawodami/
+                    // meczem. Odblokuj wysyłkę danych partii na serwer.
+                    if (!bound_.exchange(true)) {
+                        LOG_INFO("Offer claimed — wysylka danych odblokowana");
+                        qcv_.notify_all(); // obudź workerLoop z gate'a
+                    }
+                    nap(7000);
+                } else if (st.expired) {
+                    need_new = true;
+                }
             } else if (st.ok && !st.has_offer) {
                 need_new = true;
             }
@@ -2904,7 +2956,11 @@ struct Session {
     int                     whitePeerId = -1;
     int                     blackPeerId = -1;
 
-    int                     lastAcceptedSeq = -1;
+    // Deduplikacja retransmisji: licznik seq jest PER TABLET (każdy telefon
+    // liczy od 1 niezależnie!). Globalny lastAcceptedSeq powodował, że pierwszy
+    // ruch czarnych (MOVE|1|...) był odrzucany jako DUP ruchu białych (też seq=1)
+    // i tablety się rozjeżdżały. Klucz = peer_id, wartość = ostatni przyjęty seq.
+    std::unordered_map<int,int> lastSeqByPeer;
     std::string             lastAcceptedUci;
 
     bool                    awaiting_ack = false;
@@ -2989,8 +3045,8 @@ static void handle_game_events(ClockState* c, AppResources* a, ApiClient* api,
             case SDLK_q: { resume_by_arbiter(c); reportArbiter(api, "arbiter_resume", 0); return; }
             case SDLK_1: player_error(c, ACTIVE_LEFT);  reportArbiter(api, "error_white", 0); return;
             case SDLK_2: player_error(c, ACTIVE_RIGHT); reportArbiter(api, "error_black", 0); return;
-            case SDLK_3: add_bonus_time(c, ACTIVE_LEFT,  2000); reportArbiter(api, "bonus_white", 2000); return;
-            case SDLK_4: add_bonus_time(c, ACTIVE_RIGHT, 2000); reportArbiter(api, "bonus_black", 2000); return;
+            case SDLK_3: add_bonus_time(c, ACTIVE_LEFT,  120000); reportArbiter(api, "bonus_white", 120000); return;
+            case SDLK_4: add_bonus_time(c, ACTIVE_RIGHT, 120000); reportArbiter(api, "bonus_black", 120000); return;
         }
         return;
     }
@@ -3037,8 +3093,12 @@ static void handle_game_events(ClockState* c, AppResources* a, ApiClient* api,
             c->pending_uci.clear();
             sess.pendingName.clear();
             // src_peer_id = -1 (commit z UI zegara, nie od konkretnego tabletu).
-            // tryMove broadcastuje wynik do obu tabletów.
+            // tryMove broadcastuje wynik do obu tabletów. tryMove NIE przełącza
+            // już zegara — to dotknięcie JEST uderzeniem w zegar, więc po
+            // przyjętym ruchu przełączamy ręcznie.
+            size_t before = sess.moveHistory.size();
             tryMove(sess, *a, *c, bt, *api, /*src_peer_id*/-1, -1, uci, true);
+            if (sess.moveHistory.size() > before) switch_side(c, side);
         } else {
             switch_side(c, side);
         }
@@ -3067,8 +3127,10 @@ static void handle_arbiter_events(ClockState* c, AppResources* a, ApiClient* api
     }
     if (x >= 350 && x <= 570 && y >=  90 && y <= 155) { player_error(c, ACTIVE_LEFT);  reportArbiter(api, "error_white", 0); return; }
     if (x >= 620 && x <= 840 && y >=  90 && y <= 155) { player_error(c, ACTIVE_RIGHT); reportArbiter(api, "error_black", 0); return; }
-    if (x >=  80 && x <= 300 && y >= 175 && y <= 240) { add_bonus_time(c, ACTIVE_LEFT,  2000); reportArbiter(api, "bonus_white", 2000); return; }
-    if (x >= 350 && x <= 570 && y >= 175 && y <= 240) { add_bonus_time(c, ACTIVE_RIGHT, 2000); reportArbiter(api, "bonus_black", 2000); return; }
+    // +2MIN = 120000 ms (wcześniej 2000 ms = 2 sekundy — niezauważalne,
+    // wyglądało jakby przycisk nie działał).
+    if (x >=  80 && x <= 300 && y >= 175 && y <= 240) { add_bonus_time(c, ACTIVE_LEFT,  120000); reportArbiter(api, "bonus_white", 120000); return; }
+    if (x >= 350 && x <= 570 && y >= 175 && y <= 240) { add_bonus_time(c, ACTIVE_RIGHT, 120000); reportArbiter(api, "bonus_black", 120000); return; }
     
     // Przycisk ZAMKNIJ
     if (x >= 620 && x <= 840 && y >= 175 && y <= 240) { a->mode = UI_MODE_GAME; return; }
@@ -3311,7 +3373,7 @@ static void startNewGame(Session& sess, AppResources& app, ClockState& cs,
         return;
     }
     sess.over  = false;
-    sess.lastAcceptedSeq = -1;
+    sess.lastSeqByPeer.clear();
     sess.lastAcceptedUci.clear();
     cs.pending_uci.clear();
     clear_ack(sess);
@@ -3388,10 +3450,17 @@ static void tryMove(Session& sess, AppResources& /*app*/, ClockState& cs,
         return;
     }
 
-    if (seq >= 0 && seq == sess.lastAcceptedSeq) {
-        reply("DUP|" + uciStr);
-        return;
+    // DUP tylko gdy TEN SAM tablet retransmituje ten sam seq (per-peer licznik;
+    // patrz komentarz przy Session::lastSeqByPeer).
+    if (seq >= 0 && src_peer_id > 0) {
+        auto it = sess.lastSeqByPeer.find(src_peer_id);
+        if (it != sess.lastSeqByPeer.end() && it->second == seq) {
+            reply("DUP|" + uciStr);
+            return;
+        }
     }
+    // Identyczny UCI dwa razy z rzędu nie może być legalny (pole startowe jest
+    // już puste) — to zawsze retransmisja.
     if (!sess.lastAcceptedUci.empty() && sess.lastAcceptedUci == uciStr) {
         reply("DUP|" + uciStr);
         return;
@@ -3428,12 +3497,12 @@ static void tryMove(Session& sess, AppResources& /*app*/, ClockState& cs,
         cs.pending_uci.clear();
 
         sess.moveHistory.push_back(uciStr);
-        sess.lastAcceptedSeq = seq;
+        if (seq >= 0 && src_peer_id > 0) sess.lastSeqByPeer[src_peer_id] = seq;
         sess.lastAcceptedUci = uciStr;
 
-        ActiveSide side = isWhiteTurn ? ACTIVE_LEFT : ACTIVE_RIGHT;
-        if (cs.state != STATE_RUNNING) cs.state = STATE_RUNNING;
-        switch_side(&cs, side);
+        // Zegara NIE przełączamy automatycznie po ruchu — czas „uderza"
+        // człowiek, dotykając swojej połowy fizycznego zegara (handle_game_events
+        // → switch_side). Ruch z tabletu tylko aktualizuje szachownicę/serwer.
 
         long long timeLeftMs = isWhiteTurn ? cs.left.remaining_ms : cs.right.remaining_ms;
         std::string playerColor = isWhiteTurn ? "White" : "Black";
@@ -3496,11 +3565,14 @@ static void checkTimeout(Session& sess, ClockState& cs, BluetoothServer& bt,
     if (cs.state != STATE_FINISHED_LEFT_WIN && cs.state != STATE_FINISHED_RIGHT_WIN)
         return;
     std::string winner = (cs.state == STATE_FINISHED_LEFT_WIN) ? "White" : "Black";
+    // Powód z ClockState — gra mogła skończyć się nie tylko czasem, ale też
+    // decyzją arbitra (player_error ×2 → "errors").
+    std::string reason = cs.finish_reason.empty() ? "timeout" : cs.finish_reason;
     sess.over = true;
-    if (sess.networked) api.enqueueStatus("timeout", winner);
+    if (sess.networked) api.enqueueStatus(reason, winner);
     send_with_ack(bt, sess, "game_over",
-                  "GAME_OVER|" + winner + "|timeout");
-    LOG_INFO("Timeout: winner=" + winner);
+                  "GAME_OVER|" + winner + "|" + reason);
+    LOG_INFO("Game finished (" + reason + "): winner=" + winner);
 }
 
 // sendFullSync — wyślij snapshot do KONKRETNEGO peera. target_peer_id == -1
@@ -3599,6 +3671,7 @@ static void handleBluetoothCommand(const std::string& line, int src_peer_id,
         // żeby po ponownym połączeniu tablet mógł na nowo zgłosić swoją stronę.
         if (sess.whitePeerId == src_peer_id) sess.whitePeerId = -1;
         if (sess.blackPeerId == src_peer_id) sess.blackPeerId = -1;
+        sess.lastSeqByPeer.erase(src_peer_id);
         // Wymaganie #1: poniżej kompletu znów stań się wykrywalny, by brakujący
         // (lub nowy) tablet mógł dołączyć.
         bt.setDiscoverable(true);
@@ -3667,7 +3740,7 @@ static void handleBluetoothCommand(const std::string& line, int src_peer_id,
         reset_clock(&cs, s, i);
         sess.over = false;
         sess.moveHistory.clear();
-        sess.lastAcceptedSeq = -1;
+        sess.lastSeqByPeer.clear();
         sess.lastAcceptedUci.clear();
         cs.pending_uci.clear();
         clear_ack(sess);
