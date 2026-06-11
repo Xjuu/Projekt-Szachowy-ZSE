@@ -24,7 +24,6 @@
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
-#include <qrencode.h>
 
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/hci.h>
@@ -60,6 +59,7 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <dirent.h>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -108,6 +108,73 @@ static const uint32_t FRAME_WATCHDOG_MS = 2000;
 
 static const char* DEFAULT_QUEUE_FILE = "chess-clock-queue.dat";
 static const char* DEFAULT_LOG_FILE   = "chess-clock.log";
+
+// Jasność ekranu, gdy żaden tablet jeszcze się nie połączył (w %% maksimum)
+// — przyciemnia ekran QR, żeby nie świecił pełną mocą podczas oczekiwania.
+static const int BACKLIGHT_DIM_PERCENT  = 35;
+static const int BACKLIGHT_FULL_PERCENT = 100;
+
+// ─── Podświetlenie ekranu (sysfs /sys/class/backlight) ──────────────────────
+// Sterowanie przez SDL_SetWindowBrightness działa tylko na X11 i nie ma
+// efektu na typowym Pi (KMS/fbdev), więc sterujemy bezpośrednio sterownikiem
+// podświetlenia w jądrze. Bezpieczne no-opy gdy plik nie istnieje / brak uprawnień.
+class Backlight {
+public:
+    Backlight() { devicePath_ = findDevice(); }
+
+    // percent: 0-100. Brak efektu jeśli nie znaleziono urządzenia podświetlenia.
+    void setPercent(int percent) {
+        if (devicePath_.empty()) return;
+        if (percent < 0) percent = 0;
+        if (percent > 100) percent = 100;
+        if (percent == lastPercent_) return;
+
+        int max = readInt(devicePath_ + "/max_brightness");
+        if (max <= 0) max = 255;
+        int value = (max * percent) / 100;
+        if (value < 1 && percent > 0) value = 1;
+
+        if (writeInt(devicePath_ + "/brightness", value)) {
+            lastPercent_ = percent;
+        }
+    }
+
+    bool available() const { return !devicePath_.empty(); }
+
+private:
+    std::string devicePath_;
+    int lastPercent_ = -1;
+
+    static std::string findDevice() {
+        const char* base = "/sys/class/backlight";
+        DIR* d = opendir(base);
+        if (!d) return "";
+        std::string found;
+        struct dirent* ent;
+        while ((ent = readdir(d)) != nullptr) {
+            std::string name = ent->d_name;
+            if (name == "." || name == "..") continue;
+            found = std::string(base) + "/" + name;
+            break; // pierwsze znalezione urządzenie wystarczy (typowo jedno na Pi)
+        }
+        closedir(d);
+        return found;
+    }
+
+    static int readInt(const std::string& path) {
+        std::ifstream f(path);
+        int v = -1;
+        if (f) f >> v;
+        return v;
+    }
+
+    static bool writeInt(const std::string& path, int value) {
+        std::ofstream f(path);
+        if (!f) return false;
+        f << value;
+        return f.good();
+    }
+};
 
 // ─── Logger (asynchronicznie) ───────────────────────────────────────────────
 
@@ -410,10 +477,6 @@ struct AppResources {
     UIMode        mode         = UI_MODE_QR;
     uint32_t      setup_minutes   = START_MINUTES;
     uint32_t      setup_increment = INCREMENT_SECONDS;
-    SDL_Texture*  qr_texture   = nullptr;
-    int           qr_w         = 0;
-    int           qr_h         = 0;
-    std::string   qr_payload;
     std::string   bt_mac;
     int           bt_channel   = DEFAULT_BT_CHAN;
     std::string   bt_status    = "Oczekiwanie na polaczenie Bluetooth...";
@@ -517,77 +580,39 @@ static void draw_colored_button(SDL_Renderer* r, TextCache& cache, TTF_Font* f, 
               b->rect.x + (b->rect.w - tw)/2, b->rect.y + (b->rect.h - th)/2);
 }
 
-static SDL_Texture* make_qr_texture(SDL_Renderer* r, const std::string& text,
-                                    int pixel_size, int* out_w, int* out_h) {
-    QRcode* code = QRcode_encodeString(text.c_str(), 0, QR_ECLEVEL_M, QR_MODE_8, 1);
-    if (!code) return nullptr;
-
-    const int size   = code->width;
-    const int margin = 4;
-    const int imgSize = (size + margin * 2) * pixel_size;
-
-    SDL_Surface* s = SDL_CreateRGBSurfaceWithFormat(0, imgSize, imgSize, 32,
-                                                    SDL_PIXELFORMAT_RGBA32);
-    if (!s) { QRcode_free(code); return nullptr; }
-
-    SDL_FillRect(s, nullptr, SDL_MapRGBA(s->format, 255, 255, 255, 255));
-    uint32_t black = SDL_MapRGBA(s->format, 0, 0, 0, 255);
-    uint32_t* px = static_cast<uint32_t*>(s->pixels);
-
-    for (int y = 0; y < size; y++) {
-        for (int x = 0; x < size; x++) {
-            if (code->data[y * size + x] & 1) {
-                for (int dy = 0; dy < pixel_size; dy++) {
-                    for (int dx = 0; dx < pixel_size; dx++) {
-                        int xx = (margin + x) * pixel_size + dx;
-                        int yy = (margin + y) * pixel_size + dy;
-                        px[yy * imgSize + xx] = black;
-                    }
-                }
-            }
-        }
-    }
-
-    SDL_Texture* tex = SDL_CreateTextureFromSurface(r, s);
-    if (out_w) *out_w = imgSize;
-    if (out_h) *out_h = imgSize;
-    SDL_FreeSurface(s);
-    QRcode_free(code);
-    return tex;
-}
-
 static void draw_qr_screen(SDL_Renderer* r, AppResources* a) {
     SDL_SetRenderDrawColor(r, COLOR_BG.r, COLOR_BG.g, COLOR_BG.b, COLOR_BG.a);
     SDL_RenderClear(r);
 
-    blit_text(r, a->text_cache, a->font_medium, "ZESKANUJ ABY POLACZYC",
+    // Połączenie BEZ kodu QR — gracz wybiera zegar po nazwie Bluetooth z listy
+    // urządzeń na tablecie. Pokazujemy dużą nazwę + MAC + status wykrywalności.
+    blit_text(r, a->text_cache, a->font_medium, "POLACZ PRZEZ BLUETOOTH",
               COLOR_ACCENT, 20, 15);
 
-    if (a->qr_texture) {
-        int qr_draw_h = WINDOW_HEIGHT - 70;
-        int qr_draw_w = qr_draw_h;
-        SDL_Rect dst{20, 60, qr_draw_w, qr_draw_h};
-        SDL_RenderCopy(r, a->qr_texture, nullptr, &dst);
+    int x = 40;
+    int y = 80;
+    blit_text(r, a->text_cache, a->font_medium,
+              "Na tablecie wybierz urzadzenie:", COLOR_FG, x, y); y += 50;
+
+    // Duża nazwa urządzenia — to po niej gracz znajdzie zegar na liście BT.
+    blit_text(r, a->text_cache, a->font_xlarge, "Chess-Clock-Pi",
+              COLOR_ACCENT, x, y); y += 70;
+
+    if (!a->bt_mac.empty()) {
+        blit_text(r, a->text_cache, a->font_small,
+                  ("MAC: " + a->bt_mac).c_str(), COLOR_FG, x, y); y += 26;
     }
 
-    int text_x = 20 + (WINDOW_HEIGHT - 70) + 40;
-    int y = 70;
-    blit_text(r, a->text_cache, a->font_medium,
-              "Krok 1: Sparuj telefon z tym Pi", COLOR_FG, text_x, y); y += 36;
-    blit_text(r, a->text_cache, a->font_small,
-              "(Ustawienia -> Bluetooth -> chess-clock-pi)", COLOR_FG, text_x, y); y += 26;
-    blit_text(r, a->text_cache, a->font_medium,
-              "Krok 2: Otworz 'Serial Bluetooth Terminal'", COLOR_FG, text_x, y); y += 36;
-    blit_text(r, a->text_cache, a->font_small,
-              "lub aplikacje ktora skanuje QR i laczy RFCOMM.", COLOR_FG, text_x, y); y += 30;
+    bool full = (a->bt_peer_count >= a->bt_peer_max);
+    const char* disc = full
+        ? "Komplet tabletow podlaczony — zegar niewykrywalny."
+        : "Zegar WYKRYWALNY — wybierz go na obu tabletach.";
+    blit_text(r, a->text_cache, a->font_small, disc,
+              full ? COLOR_ACCENT : SDL_Color{80, 200, 120, 255}, x, y); y += 26;
 
-    blit_text(r, a->text_cache, a->font_small,
-              ("MAC: " + a->bt_mac).c_str(), COLOR_ACCENT, text_x, y); y += 22;
-    char chbuf[32]; std::snprintf(chbuf, sizeof(chbuf), "Kanal RFCOMM: %d", a->bt_channel);
-    blit_text(r, a->text_cache, a->font_small, chbuf, COLOR_ACCENT, text_x, y); y += 22;
     if (!a->server_info.empty()) {
         blit_text(r, a->text_cache, a->font_small,
-                  ("Serwer: " + a->server_info).c_str(), COLOR_FG, text_x, y); y += 22;
+                  ("Serwer: " + a->server_info).c_str(), COLOR_FG, x, y); y += 22;
     }
 
     // Wymaganie #2 — panel kodu dla sędziego (prawy-górny róg). Niezaklejmowany:
@@ -624,7 +649,7 @@ static void draw_qr_screen(SDL_Renderer* r, AppResources* a) {
     }
 
     blit_text(r, a->text_cache, a->font_small, a->bt_status.c_str(),
-              SDL_Color{200, 150, 80, 255}, text_x, WINDOW_HEIGHT - 30);
+              SDL_Color{200, 150, 80, 255}, 40, WINDOW_HEIGHT - 30);
 
     Button next_btn{{WINDOW_WIDTH - 300, WINDOW_HEIGHT - 90, 250, 60}, "PRZEJDZ DO GRY >", false};
     draw_colored_button(r, a->text_cache, a->font_medium, &next_btn, COLOR_ACCENT, COLOR_ACCENT, false);
@@ -905,7 +930,6 @@ static bool load_fonts(AppResources* a) {
 
 static void ui_cleanup(AppResources* a) {
     a->text_cache.clear();
-    if (a->qr_texture)  SDL_DestroyTexture(a->qr_texture);
     if (a->font_xlarge) TTF_CloseFont(a->font_xlarge);
     if (a->font_large)  TTF_CloseFont(a->font_large);
     if (a->font_medium) TTF_CloseFont(a->font_medium);
@@ -2217,6 +2241,11 @@ public:
     int  connected_count() const;
     bool is_connected()   const { return connected_count() > 0; }
 
+    // Wymaganie #5 — gdy jeden tablet zgłosi swój kolor, zegar musi znać id
+    // DRUGIEGO podłączonego peera, by przypisać mu kolor przeciwny. Zwraca id
+    // jedynego innego peera albo -1 (gdy nie ma dokładnie jednego innego).
+    int  otherPeerId(int peer_id) const;
+
     // Pop next inbound event from queue. src_peer_id identyfikuje od którego
     // peera przyszła linia (potrzebne do forwardingu i targetowanych odpowiedzi).
     // System events (__BT_CONNECTED__ / __BT_DISCONNECTED__) też mają peer_id.
@@ -2251,6 +2280,7 @@ private:
     void senderLoop(std::shared_ptr<BtPeer> peer);
     void enableDiscoverable();
     void forgetAllPairedDevices();
+    void forgetDevice(const std::string& mac);   // Wymaganie #6 — pojedyncze urządzenie
     // Wymaganie #3 (Linux) — zegar sam doprowadza system BT do stanu używalności
     // (rfkill, power, SSP, pairable) i rejestruje rekord SDP "Serial Port", żeby
     // telefon mógł się łączyć standardowo po UUID, bez ręcznej konfiguracji.
@@ -2489,6 +2519,22 @@ void BluetoothServer::forgetAllPairedDevices() {
     }
 }
 
+void BluetoothServer::forgetDevice(const std::string& mac) {
+    // Wymaganie #6 — usuń JEDNO urządzenie po rozłączeniu. Waliduj format MAC,
+    // żeby nie wstrzyknąć niczego do powłoki (mac pochodzi z ba2str, ale lepiej
+    // dmuchać na zimne).
+    if (mac.size() != 17) return;
+    for (size_t i = 0; i < mac.size(); ++i) {
+        bool sep = (i % 3 == 2);
+        char ch = mac[i];
+        if (sep) { if (ch != ':') return; }
+        else if (!std::isxdigit(static_cast<unsigned char>(ch))) return;
+    }
+    std::string cmd = "bluetoothctl --timeout 2 remove " + mac + " >/dev/null 2>&1";
+    if (system(cmd.c_str()) == 0) LOG_INFO("BT: forgot (disconnect) " + mac);
+    else                         LOG_WARN("BT: forget (disconnect) " + mac + " failed");
+}
+
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
 bool BluetoothServer::start(int channel) {
@@ -2697,6 +2743,9 @@ void BluetoothServer::readerLoop(std::shared_ptr<BtPeer> peer) {
             peers_.end());
     }
     pushInEvent("__BT_DISCONNECTED__", peer->id);
+    // Wymaganie #6 — po rozłączeniu zapomnij to konkretne urządzenie, żeby przy
+    // ponownym połączeniu zaczynać od czystego stanu (bez resztek po parowaniu).
+    if (!peer->addr.empty()) forgetDevice(peer->addr);
     LOG_INFO("BT peer " + std::to_string(peer->id) + " disconnected (" +
              std::to_string(connected_count()) + "/" +
              std::to_string(MAX_PEERS) + ")");
@@ -2764,6 +2813,18 @@ int BluetoothServer::connected_count() const {
     int n = 0;
     for (const auto& p : peers_) if (p->alive.load()) n++;
     return n;
+}
+
+int BluetoothServer::otherPeerId(int peer_id) const {
+    std::lock_guard<std::mutex> g(peers_mu_);
+    int other = -1;
+    int count = 0;
+    for (const auto& p : peers_) {
+        if (!p->alive.load() || p->id == peer_id) continue;
+        other = p->id;
+        count++;
+    }
+    return (count == 1) ? other : -1;
 }
 
 // ── Output ────────────────────────────────────────────────────────────────
@@ -2834,6 +2895,14 @@ struct Session {
     int                     setupMinutes   = START_MINUTES;
     int                     setupIncrement = INCREMENT_SECONDS;
     bool                    over       = false;
+
+    // Wymaganie #5 — zegar wie, który tablet (peer) jest po której stronie.
+    // To tablet zgłaszający PLAYER|White decyduje, że JEGO strona jest biała;
+    // drugi automatycznie staje się czarny. Dzięki temu zegar (a nie aplikacja)
+    // rozstrzyga przypisanie kolorów do urządzeń i pilnuje, by ruch przyszedł
+    // od właściwego tabletu. -1 = jeszcze nieznany.
+    int                     whitePeerId = -1;
+    int                     blackPeerId = -1;
 
     int                     lastAcceptedSeq = -1;
     std::string             lastAcceptedUci;
@@ -3335,6 +3404,17 @@ static void tryMove(Session& sess, AppResources& /*app*/, ClockState& cs,
 
         bool isWhiteTurn = (sess.board.sideToMove() == Color::WHITE);
 
+        // Wymaganie #5 — zegar pilnuje, że ruch przyszedł od tabletu właściwego
+        // koloru. Egzekwujemy tylko gdy znamy peera dla strony na ruchu i ruch
+        // przyszedł z sieci (src_peer_id > 0; -1 = ruch lokalny z UI zegara).
+        if (src_peer_id > 0) {
+            int expected = isWhiteTurn ? sess.whitePeerId : sess.blackPeerId;
+            if (expected > 0 && expected != src_peer_id) {
+                reply("ERR|not_your_turn|" + uciStr);
+                return;
+            }
+        }
+
         Move m;
         try { m = uci::uciToMove(sess.board, uciStr); }
         catch (...) { reply("ERR|bad_format|" + uciStr); return; }
@@ -3515,6 +3595,10 @@ static void handleBluetoothCommand(const std::string& line, int src_peer_id,
     }
     if (line == "__BT_DISCONNECTED__") {
         int cnt = bt.connected_count();
+        // Wymaganie #5 — zwolnij przypisanie koloru, które należało do tego peera,
+        // żeby po ponownym połączeniu tablet mógł na nowo zgłosić swoją stronę.
+        if (sess.whitePeerId == src_peer_id) sess.whitePeerId = -1;
+        if (sess.blackPeerId == src_peer_id) sess.blackPeerId = -1;
         // Wymaganie #1: poniżej kompletu znów stań się wykrywalny, by brakujący
         // (lub nowy) tablet mógł dołączyć.
         bt.setDiscoverable(true);
@@ -3652,14 +3736,32 @@ static void handleBluetoothCommand(const std::string& line, int src_peer_id,
 
     if (cmd == "PLAYER") {
         // Wymaganie #5 — aplikacja telefonu zgłasza imię gracza dla swojego koloru.
-        // Zapamiętujemy nazwy i rozgłaszamy obu telefonom PLAYERS|white|black, żeby
-        // strona inicjująca (białe) mogła wysłać NEWGAME z obiema nazwami, a nazwy
-        // trafiły na serwer (sendNewGame). reply OK|player do nadawcy.
+        // Zapamiętujemy nazwy ORAZ wiążemy peer_id z kolorem: tablet, który zgłosi
+        // White, ustala swoją stronę jako białą, a drugiego peera czyni czarnym.
+        // Zegar rozgłasza obu PLAYERS|white|black; reply OK|player do nadawcy.
         if (parts.size() >= 3) {
             const std::string& color = parts[1];
             const std::string& nm = parts[2];
-            if (color == "White" || color == "white")      sess.whiteName = nm;
-            else if (color == "Black" || color == "black") sess.blackName = nm;
+            bool isWhite = (color == "White" || color == "white");
+            bool isBlack = (color == "Black" || color == "black");
+            if (isWhite) {
+                sess.whiteName = nm;
+                if (src_peer_id > 0) {
+                    sess.whitePeerId = src_peer_id;
+                    // Drugi podłączony tablet automatycznie staje się czarnym.
+                    int other = bt.otherPeerId(src_peer_id);
+                    if (other > 0) sess.blackPeerId = other;
+                    if (sess.blackPeerId == src_peer_id) sess.blackPeerId = -1;
+                }
+            } else if (isBlack) {
+                sess.blackName = nm;
+                if (src_peer_id > 0) {
+                    sess.blackPeerId = src_peer_id;
+                    int other = bt.otherPeerId(src_peer_id);
+                    if (other > 0) sess.whitePeerId = other;
+                    if (sess.whitePeerId == src_peer_id) sess.whitePeerId = -1;
+                }
+            }
         }
         bt.send_line("PLAYERS|" + sess.whiteName + "|" + sess.blackName);
         reply("OK|player");
@@ -3881,17 +3983,20 @@ int main(int argc, char** argv) {
                   cfg.clockCode, cfg.apiKey, cfg.queueFile);
     api.start();
 
+    Backlight backlight;
+    if (backlight.available()) {
+        backlight.setPercent(BACKLIGHT_DIM_PERCENT);
+        LOG_INFO("Ekran: przyciemniony (" + std::to_string(BACKLIGHT_DIM_PERCENT) +
+                 "%) do czasu polaczenia tabletow");
+    }
+
     BluetoothServer bt;
     bool bt_ok = bt.start(cfg.btChannel);
     if (bt_ok) app.bt_mac = bt.mac();
     else       app.bt_status = "Blad: nie mozna uruchomic serwera Bluetooth (uruchom jako root?)";
     app.bt_peer_max = (int)BluetoothServer::MAX_PEERS;
-
-    std::ostringstream payload;
-    payload << "chessclock://" << app.bt_mac << "/" << app.bt_channel;
-    if (cfg.networked) payload << "?server=" << cfg.serverHost;
-    app.qr_payload = payload.str();
-    app.qr_texture = make_qr_texture(app.renderer, app.qr_payload, 6, &app.qr_w, &app.qr_h);
+    // Bez kodu QR: gracz wybiera zegar po nazwie Bluetooth „Chess-Clock-Pi"
+    // z listy urządzeń na tablecie (patrz draw_qr_screen / aplikacja Android).
 
     ClockState cs;
     init_clock(&cs, START_MINUTES * 60 * 1000, INCREMENT_SECONDS * 1000);
@@ -3952,6 +4057,11 @@ int main(int argc, char** argv) {
 
         // Aktualizuj counter peerów dla UI (draw_setup_screen + gate START).
         app.bt_peer_count = bt.connected_count();
+
+        // Przyciemnij ekran dopóki żaden tablet nie jest połączony przez
+        // Bluetooth; pełna jasność po pierwszym połączeniu.
+        backlight.setPercent(app.bt_peer_count > 0 ? BACKLIGHT_FULL_PERCENT
+                                                    : BACKLIGHT_DIM_PERCENT);
 
         // Wymaganie #2 — snapshot oferty kodu do UI. ttl0/fetch_local odświeżamy
         // tylko gdy serwer poda nowy server_now (między pollami odliczanie biegnie
