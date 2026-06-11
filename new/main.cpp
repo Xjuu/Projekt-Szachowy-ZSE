@@ -30,6 +30,8 @@
 #include <bluetooth/hci.h>
 #include <bluetooth/hci_lib.h>
 #include <bluetooth/rfcomm.h>
+#include <bluetooth/sdp.h>
+#include <bluetooth/sdp_lib.h>
 
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -2249,6 +2251,12 @@ private:
     void senderLoop(std::shared_ptr<BtPeer> peer);
     void enableDiscoverable();
     void forgetAllPairedDevices();
+    // Wymaganie #3 (Linux) — zegar sam doprowadza system BT do stanu używalności
+    // (rfkill, power, SSP, pairable) i rejestruje rekord SDP "Serial Port", żeby
+    // telefon mógł się łączyć standardowo po UUID, bez ręcznej konfiguracji.
+    void ensureAdapterReady();
+    void registerSdpRecord(uint8_t channel);
+    void unregisterSdpRecord();
     void pushInEvent(std::string line, int peer_id);
     void enqueueToPeer(BtPeer& peer, const std::string& line);
 
@@ -2265,6 +2273,9 @@ private:
     struct InEvent { std::string line; int peer_id; };
     mutable std::mutex                      in_mu_;
     std::deque<InEvent>                     in_queue_;
+
+    // Sesja lokalnego serwera SDP — trzymana, bo zamknięcie sesji usuwa rekord.
+    sdp_session_t*                          sdp_session_ = nullptr;
 };
 
 // ── Helpers — discoverability + zapomnij sparowane ─────────────────────────
@@ -2345,6 +2356,107 @@ void BluetoothServer::setDiscoverable(bool on) {
     }
 }
 
+// ensureAdapterReady — wymaganie #3: system BT na Linuksie ma działać "z pudełka".
+// Zamiast wymagać od operatora ręcznego bluetoothctl/rfkill, zegar sam:
+//   * odblokowuje radio (rfkill),
+//   * podnosi interfejs hci0 i włącza zasilanie adaptera,
+//   * włącza SSP (Simple Secure Pairing) — telefon łączy się bez kodu PIN,
+//   * ustawia pairable + brak timeoutów wykrywalności.
+// Wszystko best-effort przez narzędzia systemowe (bluez jest runtime dependency,
+// tak jak w forgetAllPairedDevices). Błędy logujemy, ale nie przerywają startu.
+void BluetoothServer::ensureAdapterReady() {
+    const char* steps[] = {
+        "rfkill unblock bluetooth >/dev/null 2>&1",
+        "hciconfig hci0 up >/dev/null 2>&1",
+        "hciconfig hci0 sspmode 1 >/dev/null 2>&1",
+        "bluetoothctl --timeout 2 power on >/dev/null 2>&1",
+        "bluetoothctl --timeout 2 pairable on >/dev/null 2>&1",
+        "bluetoothctl --timeout 2 discoverable-timeout 0 >/dev/null 2>&1",
+    };
+    int ok = 0;
+    for (const char* cmd : steps) if (system(cmd) == 0) ok++;
+    LOG_INFO("BT: adapter przygotowany (" + std::to_string(ok) + "/6 kroków OK)");
+}
+
+// registerSdpRecord — publikuje rekord SDP "Serial Port" (SPP) dla naszego
+// kanału RFCOMM. Dzięki temu Android może się łączyć standardowym
+// createRfcommSocketToServiceRecord(SPP_UUID), a nie tylko po numerze kanału.
+// Uwaga: na BlueZ 5 lokalna rejestracja SDP wymaga bluetoothd w trybie compat
+// (ExecStart=... bluetoothd -C). Gdy się nie uda — logujemy wskazówkę i jedziemy
+// dalej: aplikacja Android i tak ma fallback na połączenie po numerze kanału.
+void BluetoothServer::registerSdpRecord(uint8_t channel) {
+    sdp_record_t* record = sdp_record_alloc();
+    if (!record) { LOG_WARN("SDP: sdp_record_alloc failed"); return; }
+
+    uuid_t spp_uuid, root_uuid, l2cap_uuid, rfcomm_uuid;
+    sdp_profile_desc_t profile{};
+
+    sdp_uuid16_create(&spp_uuid, SERIAL_PORT_SVCLASS_ID);
+    sdp_list_t* svc_class = sdp_list_append(nullptr, &spp_uuid);
+    sdp_set_service_classes(record, svc_class);
+
+    sdp_uuid16_create(&profile.uuid, SERIAL_PORT_PROFILE_ID);
+    profile.version = 0x0100;
+    sdp_list_t* profiles = sdp_list_append(nullptr, &profile);
+    sdp_set_profile_descs(record, profiles);
+
+    sdp_uuid16_create(&root_uuid, PUBLIC_BROWSE_GROUP);
+    sdp_list_t* root = sdp_list_append(nullptr, &root_uuid);
+    sdp_set_browse_groups(record, root);
+
+    sdp_uuid16_create(&l2cap_uuid, L2CAP_UUID);
+    sdp_list_t* l2cap = sdp_list_append(nullptr, &l2cap_uuid);
+    sdp_list_t* proto = sdp_list_append(nullptr, l2cap);
+
+    sdp_uuid16_create(&rfcomm_uuid, RFCOMM_UUID);
+    sdp_data_t* chan_data = sdp_data_alloc(SDP_UINT8, &channel);
+    sdp_list_t* rfcomm = sdp_list_append(nullptr, &rfcomm_uuid);
+    sdp_list_append(rfcomm, chan_data);
+    sdp_list_append(proto, rfcomm);
+
+    sdp_list_t* access = sdp_list_append(nullptr, proto);
+    sdp_set_access_protos(record, access);
+
+    sdp_set_info_attr(record, "Chess-Clock-Pi", "ChessClock",
+                      "Chess clock RFCOMM relay");
+
+    // BDADDR_ANY/BDADDR_LOCAL to compound-literals C — w C++ robimy lokalne kopie.
+    bdaddr_t any{};                                  // 00:00:00:00:00:00
+    bdaddr_t local{{0, 0, 0, 0xff, 0xff, 0xff}};     // adres "lokalny SDP serwer"
+    sdp_session_ = sdp_connect(&any, &local, SDP_RETRY_IF_BUSY);
+    if (sdp_session_ && sdp_record_register(sdp_session_, record, 0) == 0) {
+        LOG_INFO("SDP: rekord SPP zarejestrowany (kanal " +
+                 std::to_string((int)channel) + ")");
+    } else {
+        if (sdp_session_) { sdp_close(sdp_session_); sdp_session_ = nullptr; }
+        LOG_WARN("SDP: rejestracja nieudana — telefon polaczy sie po numerze kanalu. "
+                 "Aby wlaczyc SDP: dodaj '-C' do ExecStart bluetoothd "
+                 "(/lib/systemd/system/bluetooth.service) i zrestartuj usluge.");
+        // Fallback przez sdptool (tez wymaga trybu compat, ale nie zaszkodzi).
+        char cmd[96];
+        std::snprintf(cmd, sizeof(cmd),
+                      "sdptool add --channel=%d SP >/dev/null 2>&1", (int)channel);
+        if (system(cmd) == 0) LOG_INFO("SDP: rekord dodany przez sdptool");
+        sdp_record_free(record);
+    }
+
+    sdp_data_free(chan_data);
+    sdp_list_free(svc_class, nullptr);
+    sdp_list_free(profiles, nullptr);
+    sdp_list_free(root, nullptr);
+    sdp_list_free(l2cap, nullptr);
+    sdp_list_free(rfcomm, nullptr);
+    sdp_list_free(proto, nullptr);
+    sdp_list_free(access, nullptr);
+}
+
+void BluetoothServer::unregisterSdpRecord() {
+    if (sdp_session_) {
+        sdp_close(sdp_session_); // zamknięcie sesji usuwa zarejestrowany rekord
+        sdp_session_ = nullptr;
+    }
+}
+
 void BluetoothServer::forgetAllPairedDevices() {
     // Cel: czysty stan przy następnym uruchomieniu. Wyciągamy MAC-i wszystkich
     // sparowanych urządzeń przez `bluetoothctl paired-devices` (część pakietu
@@ -2381,6 +2493,9 @@ void BluetoothServer::forgetAllPairedDevices() {
 
 bool BluetoothServer::start(int channel) {
     channel_ = channel;
+
+    // Wymaganie #3 — najpierw doprowadź systemowy BT (Linux) do porządku.
+    ensureAdapterReady();
 
     int dev_id = hci_get_route(nullptr);
     if (dev_id >= 0) {
@@ -2420,6 +2535,10 @@ bool BluetoothServer::start(int channel) {
         return false;
     }
 
+    // Wymaganie #3 — rekord SDP "Serial Port", żeby Android mógł łączyć się
+    // standardowo po UUID SPP (z fallbackiem na numer kanału w aplikacji).
+    registerSdpRecord(static_cast<uint8_t>(channel));
+
     running_ = true;
     accept_thr_ = std::thread(&BluetoothServer::acceptLoop, this);
     LOG_INFO("BluetoothServer listening on RFCOMM channel " +
@@ -2454,6 +2573,9 @@ void BluetoothServer::stop() {
     }
 
     if (accept_thr_.joinable()) accept_thr_.join();
+
+    // Usuń rekord SDP (zamknięcie sesji wyrejestrowuje wpis).
+    unregisterSdpRecord();
 
     // Wymaganie #1: zapomnij sparowane urządzenia przy shutdown.
     forgetAllPairedDevices();
