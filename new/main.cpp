@@ -1942,7 +1942,11 @@ private:
         std::string gid = gameId();
         if (gid.empty()) return false;
         std::ostringstream b;
+        // "move" = kanoniczny klucz serwera (handleMove); "uci" zostaje jako
+        // alias dla starszych wersji serwera. Wcześniej szło TYLKO "uci",
+        // którego serwer nie czytał → w bazie lądowały puste ruchy.
         b << "{\"game_id\":" << gid << ","
+          << "\"move\":\""   << r.uci << "\","
           << "\"uci\":\""    << r.uci << "\","
           << "\"player\":\"" << r.color << "\","
           << "\"time_left_ms\":" << r.timeLeftMs << "}";
@@ -2184,6 +2188,21 @@ private:
         };
         nap(800);
         bool need_new = true;
+        // Wznowienie po restarcie zegara: jeśli ostatnia oferta jest już
+        // ZAKLEJMOWANA (sędzia wpisał kod wcześniej), przywróć związanie
+        // zamiast generować nowy kod. Bez tego restart zegara zrywał binding
+        // i wstrzymywał wysyłkę danych aż do ponownego wpisania kodu.
+        {
+            OfferStatusInfo st0 = apiOfferStatus(ip_, port_, clockCode_, &abort_flag_);
+            if (st0.ok && st0.has_offer && st0.claimed) {
+                { std::lock_guard<std::mutex> g(offer_mu_); offer_ = st0; }
+                if (!bound_.exchange(true)) {
+                    LOG_INFO("Offer claimed (przywrocone po restarcie) — wysylka odblokowana");
+                    qcv_.notify_all();
+                }
+                need_new = false;
+            }
+        }
         while (running_.load()) {
             if (need_new) {
                 OfferInfo oi = apiOfferCreate(ip_, port_, clockCode_, &abort_flag_);
@@ -3517,14 +3536,19 @@ static void tryMove(Session& sess, AppResources& /*app*/, ClockState& cs,
             reply(uciStr);
         }
 
-        // Forwarding do drugiego tabletu (wymaganie #2) — żeby jego
-        // szachownica też wiedziała o ruchu. seq w formacie "MOVE|seq|uci"
-        // pozwala tabletowi deduplikować jeśli sam by go zobaczył (ale i tak
-        // przesyłamy tylko legalne ruchy, więc duplikat byłby rzadkością).
-        if (src_peer_id > 0) {
+        // Forwarding do pozostałych tabletów: "MOVE|seq|uci|ply", gdzie ply =
+        // numer półruchu (1-based, rozmiar historii PO tym ruchu). Tablet
+        // porównuje ply ze swoim licznikiem: ply <= lokalny → stary duplikat
+        // (ignoruje); ply > lokalny+1 → zgubił ruch → prosi o SYNC_REQUEST.
+        // To domyka każdą desynchronizację automatycznie, niezależnie od
+        // przyczyny. Działa też dla ruchów lokalnych z UI zegara
+        // (src_peer_id == -1 → send_line_except(-1) = broadcast do wszystkich;
+        // wcześniej tablety w ogóle nie dostawały lokalnie zatwierdzanych
+        // ruchów w formacie MOVE).
+        {
             std::ostringstream fwd;
             fwd << "MOVE|" << (seq >= 0 ? std::to_string(seq) : "0")
-                << "|" << uciStr;
+                << "|" << uciStr << "|" << sess.moveHistory.size();
             bt.send_line_except(src_peer_id, fwd.str());
         }
 
