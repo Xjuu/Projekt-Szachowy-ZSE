@@ -106,6 +106,10 @@ static const int    BT_SEND_TIMEOUT_MS = 1500;
 static const int    QUEUE_PERSIST_MIN_INTERVAL_MS = 250;
 static const uint32_t FRAME_WATCHDOG_MS = 2000;
 
+// Wymaganie #1 — uśpienie sesji po braku sygnału (tabletów) i okno powrotu.
+static const uint32_t IDLE_DISCONNECT_MS   = 5u  * 60u * 1000u; // 5 min bez tabletów → uśpij
+static const uint32_t RECONNECT_WINDOW_MS  = 25u * 60u * 1000u; // 25 min na powrót → pytaj
+
 static const char* DEFAULT_QUEUE_FILE = "chess-clock-queue.dat";
 static const char* DEFAULT_LOG_FILE   = "chess-clock.log";
 
@@ -385,7 +389,7 @@ static void add_bonus_time(ClockState* c, ActiveSide who, uint32_t bonus_ms) {
 
 // ─── UI resources ───────────────────────────────────────────────────────────
 
-enum UIMode { UI_MODE_QR, UI_MODE_SETUP, UI_MODE_GAME, UI_MODE_HELP, UI_MODE_ARBITER, UI_MODE_PAIRING };
+enum UIMode { UI_MODE_QR, UI_MODE_SETUP, UI_MODE_GAME, UI_MODE_HELP, UI_MODE_ARBITER, UI_MODE_PAIRING, UI_MODE_RECONNECT };
 
 struct TextCacheKey {
     TTF_Font*   font;
@@ -502,6 +506,11 @@ struct AppResources {
     std::string   offer_target_kind;
     std::string   offer_target_name;
     long long     offer_table_no = 0;
+    // ── Wymaganie #1 — uśpienie sesji po braku sygnału + pytanie o powrót ────
+    bool          session_bound_seen = false; // czy byliśmy kiedyś związani ze stołem
+    bool          session_stale      = false; // brak sygnału >5 min → uśpione
+    uint32_t      last_signal_ms     = 0;      // ostatni moment z ≥1 tabletem
+    uint32_t      stale_since_ms     = 0;      // kiedy uśpiono
 };
 
 struct Button {
@@ -1195,13 +1204,44 @@ static void draw_pairing_screen(SDL_Renderer* r, AppResources* a) {
               COLOR_FG, back.x + 30, back.y + 20);
 }
 
+// draw_reconnect_screen — wymaganie #1: po uśpieniu sesji (brak sygnału 5 min)
+// i powrocie tabletu w oknie 25 min pytamy operatora, czy wrócić do tego samego
+// stołu/zawodów. TAK = wznów wysyłkę; NIE = odepnij i wygeneruj nowy kod.
+static void draw_reconnect_screen(SDL_Renderer* r, AppResources* a) {
+    SDL_SetRenderDrawColor(r, COLOR_BG.r, COLOR_BG.g, COLOR_BG.b, COLOR_BG.a);
+    SDL_RenderClear(r);
+
+    blit_text(r, a->text_cache, a->font_medium, "WYKRYTO POWROT TABLETU",
+              COLOR_ACCENT, 40, 30);
+    blit_text(r, a->text_cache, a->font_small,
+              "Sesja byla uspiona (brak sygnalu ponad 5 min).", COLOR_FG, 40, 80);
+
+    std::string q = "Polaczyc ponownie z poprzednim stolem?";
+    blit_text(r, a->text_cache, a->font_medium, q.c_str(), COLOR_FG, 40, 120);
+
+    if (a->offer_claimed && !a->offer_target_name.empty()) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "%s — stol %lld",
+                      a->offer_target_name.c_str(), a->offer_table_no);
+        blit_text(r, a->text_cache, a->font_large, buf, COLOR_ACCENT, 40, 165);
+    }
+
+    Button yes_btn{{ 40, 250, 300, 90}, "TAK, WROC", false};
+    Button no_btn {{380, 250, 300, 90}, "NIE, NOWY STOL", false};
+    draw_colored_button(r, a->text_cache, a->font_medium, &yes_btn,
+                        COLOR_BUTTON_NORMAL, COLOR_BUTTON_NORMAL, false);
+    draw_colored_button(r, a->text_cache, a->font_medium, &no_btn,
+                        COLOR_BUTTON_ERROR, COLOR_BUTTON_ERROR, false);
+}
+
 static void ui_render_frame(SDL_Renderer* r, AppResources* a, const ClockState* c) {
     switch (a->mode) {
-        case UI_MODE_QR:      draw_qr_screen(r, a);          break;
-        case UI_MODE_SETUP:   draw_setup_screen(r, a);       break;
-        case UI_MODE_HELP:    draw_help_screen(r, a);        break;
-        case UI_MODE_ARBITER: draw_arbiter_menu(r, a, c);    break;
-        case UI_MODE_PAIRING: draw_pairing_screen(r, a);     break;
+        case UI_MODE_QR:        draw_qr_screen(r, a);          break;
+        case UI_MODE_SETUP:     draw_setup_screen(r, a);       break;
+        case UI_MODE_HELP:      draw_help_screen(r, a);        break;
+        case UI_MODE_ARBITER:   draw_arbiter_menu(r, a, c);    break;
+        case UI_MODE_PAIRING:   draw_pairing_screen(r, a);     break;
+        case UI_MODE_RECONNECT: draw_reconnect_screen(r, a);   break;
         case UI_MODE_GAME:
         default:              draw_game_screen(r, a, c);     break;
     }
@@ -1770,6 +1810,28 @@ public:
     // związaniu. true = wysyłka odblokowana.
     bool bound() const { return bound_.load(); }
 
+    // Wymaganie #1 — uśpienie sesji po braku sygnału (5 min) i okno powrotu
+    // (25 min). suspendUpload wstrzymuje wysyłkę BEZ utraty związania (dane
+    // czekają w kolejce); resumeUpload wznawia; forgetSession całkowicie
+    // odpina zegar od stołu i wymusza wygenerowanie NOWEGO kodu oferty.
+    void suspendUpload() { upload_suspended_.store(true); }
+    void resumeUpload() {
+        upload_suspended_.store(false);
+        qcv_.notify_all();
+    }
+    bool uploadSuspended() const { return upload_suspended_.load(); }
+    void forgetSession() {
+        bound_.store(false);
+        upload_suspended_.store(false);
+        clearGameId();
+        restart_offer_.store(true);
+        {
+            std::lock_guard<std::mutex> g(offer_mu_);
+            offer_ = OfferStatusInfo{};
+        }
+        qcv_.notify_all();
+    }
+
     // ── Heartbeat (live clock push) ────────────────────────────────────────
     // Nadpisuje cache najnowszych wartości. Wątek hbLoop_ co ~HB_INTERVAL_MS
     // wysyła POST /api/clock/heartbeat ze świeżymi liczbami. Brak retry, brak
@@ -1845,10 +1907,11 @@ private:
                 queue_.pop_front();
             }
 
-            // Dopóki kod nie został wpisany (bound_ == false) — NIC nie wysyłamy.
-            // Żądanie wraca na początek kolejki i czekamy; po związaniu cała
-            // kolejka leci na serwer w oryginalnej kolejności (zero utraty danych).
-            if (!bound_.load()) {
+            // Dopóki kod nie został wpisany (bound_ == false) LUB sesja uśpiona
+            // (brak sygnału — wymaganie #1) — NIC nie wysyłamy. Żądanie wraca na
+            // początek kolejki i czeka; po związaniu/wznowieniu cała kolejka
+            // leci na serwer w oryginalnej kolejności (zero utraty danych).
+            if (!bound_.load() || upload_suspended_.load()) {
                 {
                     std::lock_guard<std::mutex> g(qmu_);
                     queue_.push_front(std::move(req));
@@ -2121,6 +2184,9 @@ private:
     // Gate wysyłki danych partii (patrz bound()). Ustawiane przez pairWithCode
     // (kod wpisany na zegarze) lub offerLoop (kod zaklejmowany przez sędziego).
     std::atomic<bool> bound_{false};
+    // Wymaganie #1 — wstrzymanie wysyłki (sesja uśpiona) + żądanie nowej oferty.
+    std::atomic<bool> upload_suspended_{false};
+    std::atomic<bool> restart_offer_{false};
     std::mutex qmu_;
     std::condition_variable qcv_;
     std::mutex persist_mu_;
@@ -2159,7 +2225,7 @@ private:
                 have = hb_has_data_;
             }
             if (!have) continue;
-            if (!bound_.load()) continue; // kod nie wpisany → nie wysyłamy
+            if (!bound_.load() || upload_suspended_.load()) continue; // nie wpisany kod / sesja uśpiona
 
             std::string gid = gameId();
             if (gid.empty()) continue; // partia jeszcze nieutworzona na serwerze
@@ -2204,6 +2270,12 @@ private:
             }
         }
         while (running_.load()) {
+            // Wymaganie #1 — operator odrzucił powrót do poprzedniego stołu
+            // (albo minęło 25 min): wymuś świeży kod oferty, ignorując stare
+            // (być może wciąż zaklejmowane) powiązanie.
+            if (restart_offer_.exchange(false)) {
+                need_new = true;
+            }
             if (need_new) {
                 OfferInfo oi = apiOfferCreate(ip_, port_, clockCode_, &abort_flag_);
                 if (oi.ok) {
@@ -2974,6 +3046,9 @@ struct Session {
     // od właściwego tabletu. -1 = jeszcze nieznany.
     int                     whitePeerId = -1;
     int                     blackPeerId = -1;
+    // Wymaganie #2 — strona, po której biały gracz ma zegar ("left"/"right").
+    // Informacyjne: potwierdza fizyczne przypisanie stron (LEFT=białe na ekranie).
+    std::string             clockSide;
 
     // Deduplikacja retransmisji: licznik seq jest PER TABLET (każdy telefon
     // liczy od 1 niezależnie!). Globalny lastAcceptedSeq powodował, że pierwszy
@@ -3242,6 +3317,36 @@ static void handle_qr_events(AppResources* a, const SDL_Event* e, bool* running)
     }
 }
 
+// handle_reconnect_events — wymaganie #1. TAK = wznów wysyłkę do tego samego
+// stołu; NIE = odepnij zegar i wygeneruj nowy kod oferty (świeży stół).
+static void handle_reconnect_events(AppResources* a, ApiClient* api,
+                                    const SDL_Event* e, bool* running) {
+    if (e->type == SDL_QUIT) { *running = false; return; }
+    auto choose = [&](bool reconnect) {
+        a->session_stale = false;
+        a->last_signal_ms = SDL_GetTicks();
+        if (reconnect) {
+            api->resumeUpload();
+            a->mode = UI_MODE_GAME;
+        } else {
+            a->session_bound_seen = false;
+            api->forgetSession();
+            a->mode = UI_MODE_SETUP;
+        }
+    };
+    if (e->type == SDL_KEYDOWN) {
+        if (e->key.keysym.sym == SDLK_RETURN || e->key.keysym.sym == SDLK_KP_ENTER) choose(true);
+        else if (e->key.keysym.sym == SDLK_ESCAPE) choose(false);
+        return;
+    }
+    if (e->type != SDL_MOUSEBUTTONDOWN) return;
+    int x = e->button.x, y = e->button.y;
+    if (y >= 250 && y <= 340) {
+        if (x >= 40 && x <= 340)       choose(true);
+        else if (x >= 380 && x <= 680) choose(false);
+    }
+}
+
 static void ui_process_events(ClockState* c, AppResources* a, ApiClient* api,
                               Session& sess, BluetoothServer& bt,
                               bool* running) {
@@ -3286,6 +3391,7 @@ static void ui_process_events(ClockState* c, AppResources* a, ApiClient* api,
             case UI_MODE_SETUP:   handle_setup_events(c, a, &e, running);      break;
             case UI_MODE_ARBITER: handle_arbiter_events(c, a, api, &e, running); break;
             case UI_MODE_PAIRING: handle_pairing_events(a, api, &e, running);  break;
+            case UI_MODE_RECONNECT: handle_reconnect_events(a, api, &e, running); break;
             case UI_MODE_HELP:
                 if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE)
                     a->mode = UI_MODE_GAME;
@@ -3865,6 +3971,16 @@ static void handleBluetoothCommand(const std::string& line, int src_peer_id,
         return;
     }
 
+    if (cmd == "CLOCKSIDE") {
+        // Wymaganie #2 — biały tablet zgłasza, po której stronie stoi zegar.
+        // Zapamiętujemy do weryfikacji/logu; fizyczny ekran zegara pozostaje
+        // LEFT=białe, RIGHT=czarne (zgodnie z bindingiem whitePeerId z #5).
+        if (parts.size() >= 2) sess.clockSide = parts[1];
+        LOG_INFO("Orientacja zegara wg bialych: " + sess.clockSide);
+        reply("OK|clockside");
+        return;
+    }
+
     reply("ERR|unknown_command|" + cmd);
     LOG_WARN("Unknown BT command from peer " +
              std::to_string(src_peer_id) + ": " + cmd);
@@ -4154,6 +4270,39 @@ int main(int argc, char** argv) {
 
         // Aktualizuj counter peerów dla UI (draw_setup_screen + gate START).
         app.bt_peer_count = bt.connected_count();
+
+        // ── Wymaganie #1 — uśpienie sesji po braku sygnału + pytanie o powrót ──
+        // "Sygnał" = co najmniej jeden podłączony tablet. Gdy zegar jest związany
+        // ze stołem (bound) i przez 5 min nikt nie jest podłączony → usypiamy
+        // sesję (wstrzymujemy wysyłkę, NIE tracąc danych). Jeśli tablet wróci w
+        // ciągu 25 min → pytamy operatora czy wrócić do tego stołu. Po 25 min →
+        // odpinamy stół i generujemy nowy kod (świeży stół).
+        {
+            uint32_t tnow = SDL_GetTicks();
+            if (app.bt_peer_count > 0) app.last_signal_ms = tnow;
+            if (api.bound() && !api.uploadSuspended()) app.session_bound_seen = true;
+
+            if (!app.session_stale && app.session_bound_seen &&
+                app.bt_peer_count == 0 && app.last_signal_ms != 0 &&
+                tnow - app.last_signal_ms > IDLE_DISCONNECT_MS) {
+                app.session_stale = true;
+                app.stale_since_ms = tnow;
+                api.suspendUpload();
+                LOG_INFO("Sesja uspiona — brak sygnalu >5 min, wstrzymano wysylke");
+            }
+            if (app.session_stale) {
+                if (app.bt_peer_count > 0 &&
+                    (tnow - app.stale_since_ms) <= RECONNECT_WINDOW_MS) {
+                    if (app.mode != UI_MODE_RECONNECT) app.mode = UI_MODE_RECONNECT;
+                } else if ((tnow - app.stale_since_ms) > RECONNECT_WINDOW_MS) {
+                    app.session_stale = false;
+                    app.session_bound_seen = false;
+                    api.forgetSession();
+                    app.mode = UI_MODE_QR; // świeży kod pokaże się na ekranie połączenia
+                    LOG_INFO("Okno 25 min minelo — odpinam stol, nowy kod oferty");
+                }
+            }
+        }
 
         // Przyciemnij ekran dopóki żaden tablet nie jest połączony przez
         // Bluetooth; pełna jasność po pierwszym połączeniu.
