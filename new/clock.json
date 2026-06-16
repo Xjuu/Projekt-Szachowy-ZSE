@@ -2,6 +2,6 @@
   "clock_code":  "CHS-XXXX-XXXX-XXXX",
   "public_key":  "pk_...",
   "private_key": "sk_...",
-  "server":      "192.168.1.101:443",
+  "server":      "83.20.80.17:443",
   "bt_channel":  1
 }
