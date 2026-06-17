@@ -4367,4 +4367,3 @@ int main(int argc, char** argv) {
     Logger::instance().close();
     return 0;
 }
-
